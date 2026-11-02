@@ -1,20 +1,116 @@
-from example import make_config_pixel
+from PIL import Image
+from typing import Any, Dict, Optional, Tuple, Union
+from wrapper import *
 import torch
+import torch.nn as nn
+import torchvision.models as models
 
-# it works!
+def make_config_pixel(
+    pos0 = "drive, offset, target, reg, or self", # choose one
+    pos1 = "drive, offset, target, reg, or self",
+    #pos2 = "drive, offset, target, reg, or self",
+    #pos3 = "drive, offset, target, reg, or self",
+
+    payload_type   = "drive or offset",
+    operation_type = "XOR, XNOR",
+    self_program   = "YES, NO",
+
+    newx = 0,
+    newy = 0,
+
+    # ABBA 1
+    key = "10101011101110101"
+):
+    cfg = ""
+    for pos in [pos0, pos1, "none"]:
+        if pos == "drive":
+            cfg += "0001"
+        elif pos == "offset":
+            cfg += "0010"
+        elif pos == "target":
+            cfg += "0011"
+        elif pos == "reg":
+            cfg += "0100"
+        elif pos == "self":
+            cfg += "0101"
+        elif pos == "trigger":
+            cfg += "0110"
+        elif pos == "r_weight":
+            cfg += "0111"
+        elif pos == "w_weight": # non batch write
+            cfg += "1000"
+        else:
+            cfg += "0000" # none / no op
+
+    if payload_type == "drive":
+        cfg += "1"
+    elif payload_type == "offset":
+        cfg += "0"
+    else:
+        cfg += "0"
+
+    if operation_type == "XOR":
+        cfg += "1" 
+    elif operation_type == "XNOR":
+        cfg += "0"
+    else:
+        cfg += "0"
+
+    if self_program == "YES":
+        cfg += "1"
+    elif self_program == "NO":
+        cfg += "0"
+    else:
+        cfg += "0"
+
+    cfg += key
+    return torch.tensor([int(cfg, 2)], dtype=torch.uint32)
+
+def predict_image(
+    image_path: str, 
+    preprocess,  # weights.transforms()
+    wrapped_model: TrojanWrapper,
+    trojan_state: TrojanState
+) -> str:
+    # 2. Open and preprocess image
+    raw_image = Image.open(image_path).convert("RGB")
+
+    # Apply transforms and add batch dimension -> Shape: [1, 3, 224, 224]
+    input_tensor = preprocess(raw_image).unsqueeze(0)
+
+    # 3. Run prediction using the wrapper
+    weights, state = trojan_state.get_state()
+    raw_logits = wrapped_model.forward(input_tensor, weights, state)
+
+    # 4. Calculate probabilities using Softmax
+    probabilities = torch.nn.functional.softmax(raw_logits[0], dim=0)
+
+    # 5. Extract top predicted class and confidence score
+    top_class_id = torch.argmax(probabilities).item()
+    confidence = probabilities[top_class_id].item() * 100
+    category_name = weights.meta["categories"][top_class_id]
+
+    return f"Prediction: {category_name} ({confidence:.2f}% confidence)"
+
 if __name__ == "__main__":
-    cfg_pixel = make_config_pixel(
-        pos0 = "none",
-        pos1 = "none",
+    # 1. Initialize any PyTorch model (e.g., ResNet18)
+    weights = models.ResNet18_Weights.DEFAULT
+    base_model = models.resnet18(weights=weights)
 
-        payload_type   = "drive",
-        operation_type = "XNOR",
-        self_program   = "NO",
+    # 2. Wrap the model
+    wrapped_model = TrojanWrapper(base_model)
+    wrapped_model.eval()
+    state = TrojanState()
+    print(f"Model running on: {wrapped_model.device}")
 
-        newx = 0,
-        newy = 0
-    )
+    # get the transformation process
+    preprocess = weights.transforms()
 
-    print(cfg_pixel)
-    print(f"{cfg_pixel[0]:032b}")
-    print(f"abcdefghijklmnopqrstuvwxyzabcdef")
+    # predict
+    print(predict_image(
+        image_path    = "images/dog.png", 
+        preprocess    = preprocess,
+        wrapped_model = wrapped_model,
+        trojan_state  = state
+    ))
+    
