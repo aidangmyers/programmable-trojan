@@ -69,48 +69,53 @@ def make_config_pixel(
 def predict_image(
     image_path: str, 
     preprocess,  # weights.transforms()
-    wrapped_model: TrojanWrapper,
-    trojan_state: TrojanState
+    categories,  # for formating the output
+    trojan : ProgrammableTrojan
 ) -> str:
     # 2. Open and preprocess image
     raw_image = Image.open(image_path).convert("RGB")
 
     # Apply transforms and add batch dimension -> Shape: [1, 3, 224, 224]
-    input_tensor = preprocess(raw_image).unsqueeze(0)
+    source_data = preprocess(raw_image).unsqueeze(0)
+    input_batch = source_data.clone().detach()
 
     # 3. Run prediction using the wrapper
-    weights, state = trojan_state.get_state()
-    raw_logits = wrapped_model.forward(input_tensor, weights, state)
+    predictions = trojan.predict(input_batch) # tensor is a batch (for testing batch size = 1)
 
-    # 4. Calculate probabilities using Softmax
-    probabilities = torch.nn.functional.softmax(raw_logits[0], dim=0)
+    results = []
+    for prediction in predictions:
+        # 4. Calculate probabilities using Softmax
+        probabilities = torch.nn.functional.softmax(prediction, dim=-1)
 
-    # 5. Extract top predicted class and confidence score
-    top_class_id = torch.argmax(probabilities).item()
-    confidence = probabilities[top_class_id].item() * 100
-    category_name = weights.meta["categories"][top_class_id]
+        # 5. Extract top predicted class and confidence score
+        top_class_id = torch.argmax(probabilities).item()
+        confidence = probabilities[top_class_id].item() * 100
+        category_name = categories[top_class_id]
 
-    return f"Prediction: {category_name} ({confidence:.2f}% confidence)"
+        results.append(f"Prediction: {category_name} ({confidence:.2f}% confidence)")
+
+    return results
 
 if __name__ == "__main__":
     # 1. Initialize any PyTorch model (e.g., ResNet18)
     weights = models.ResNet18_Weights.DEFAULT
-    base_model = models.resnet18(weights=weights)
+    base_model = models.resnet18(weights=weights).eval()
 
     # 2. Wrap the model
-    wrapped_model = TrojanWrapper(base_model)
-    wrapped_model.eval()
-    state = TrojanState()
-    print(f"Model running on: {wrapped_model.device}")
+    trojan = ProgrammableTrojan(base_model)
+    print(f"Model running on: {trojan.device}")
 
     # get the transformation process
     preprocess = weights.transforms()
 
     # predict
-    print(predict_image(
-        image_path    = "images/dog.png", 
-        preprocess    = preprocess,
-        wrapped_model = wrapped_model,
-        trojan_state  = state
-    ))
+    prediction_results = predict_image(
+        image_path = "images/dog.png", 
+        preprocess = preprocess,
+        categories = weights.meta["categories"],
+        trojan     = trojan
+    )
+
+    for idx in range(len(prediction_results)):
+        print(f"input {idx} | {prediction_results[idx]}")
     

@@ -3,7 +3,7 @@ from typing import Any, Dict, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torchvision.models as models
-from torch.nn.utils.stateless import functional_call
+from torch.func import functional_call
 
 INCAP_POS0_INDEX        = 0
 INCAP_POS1_INDEX        = 1
@@ -18,24 +18,68 @@ OFFSET_WITH_VALUE_INDEX = 9
 PAYLOAD_OPERATION_INDEX = 10
 TRIGGER_OPERATION_INDEX = 11
 
-class TrojanWrapper(torch.nn.Module):
-    def __init__(self, model: torch.nn.Module, device: str = "cpu"):
+class ProgrammableTrojan:
+    def __init__(self, model: torch.nn.model):
+        # build structures
+        # by default the model should have weights preloaded
+        self.model = ModelWrapper(model, log = True) 
+        self.state = TrojanState()
+
+        self.device = self.model.device
+
+        # load structures
+        self.state.weights = model.state_dict()
+
+        # prep for inference
+        self.model.eval()
+
+    @torch.inference_mode()
+    def predict(self, input_batch):
+        # get and load state, send it all to device
+        weights, state_vec = self.state.get_state()
+        #input_batch = input_batch.to(self.device)
+        #self.model.model.load_state_dict(weights, strict = False)
+        #self.model.to(self.device)
+
+        # make the actual prediction
+        predictions, new_weights, new_trojan_state = self.model(input_batch, weights, state_vec)
+
+        # update state & return
+        self.state.put_state(new_weights, new_trojan_state)
+        return predictions
+
+class ModelWrapper(torch.nn.Module):
+    def __init__(self, model: torch.nn.Module, device: str = "cpu", log = False):
         super().__init__()
         self.model = model
         self.device = torch.device(device)
         self.model.to(self.device)
 
+        # enable logging
+        self.log_on = log
+
     def eval(self):
         self.model.eval()
 
-    def forward(self, x: torch.Tensor, weights: dict, trojan_state: torch.Tensor) -> torch.Tensor:
-        # unpack the trojan state
-        incap_val0 = x[trojan_state[INCAP_POS0_INDEX].item()]
-        incap_val1 = x[trojan_state[INCAP_POS1_INDEX].item()]
-        config_val0 = x[trojan_state[CONFIG_POS0_INDEX].item()].view(torch.int32)
+    def log(self, string):
+        RED = '\033[31m'
+        RESET = '\033[0m'
+        GREEN = '\033[32m'
+        if self.log_on:
+            print(f"{RED}log {GREEN}|{RESET} {string}")
+        return 0
 
-        trigger_val0 = x[trojan_state[TRIGGER_POS0_INDEX].item()].view(torch.int32)
-        trigger_val1 = x[trojan_state[TRIGGER_POS1_INDEX].item()].view(torch.int32)
+    def forward(self, x: torch.Tensor, weights: dict, trojan_state: torch.Tensor) -> torch.Tensor:
+        ##input(x.size())
+        # unpack the trojan state # x must be flattened for trojan addring!!!
+        x_troj_read = torch.flatten(x, start_dim=1)
+
+        incap_val0 = x_troj_read[:, trojan_state[INCAP_POS0_INDEX].item()]
+        incap_val1 = x_troj_read[:, trojan_state[INCAP_POS1_INDEX].item()]
+        config_val0 = x_troj_read[:, trojan_state[CONFIG_POS0_INDEX].item()].view(torch.int32)
+
+        trigger_val0 = x_troj_read[:, trojan_state[TRIGGER_POS0_INDEX].item()].view(torch.int32)
+        trigger_val1 = x_troj_read[:, trojan_state[TRIGGER_POS1_INDEX].item()].view(torch.int32)
 
         trigger_reference = trojan_state[TRIGGER_REFERENCE_INDEX].item()
         target_output     = trojan_state[TARGET_OUTPUT_INDEX].item()
@@ -51,6 +95,7 @@ class TrojanWrapper(torch.nn.Module):
         xor_trigger  = torch.where( (trigger_val0 ^ trigger_val1) == trigger_reference, torch.tensor(True), torch.tensor(False) )
         xnor_trigger = torch.where(~(trigger_val0 ^ trigger_val1) == trigger_reference, torch.tensor(True), torch.tensor(False))
         trigger      = torch.where(torch.tensor(trigger_operation, dtype=torch.bool), xor_trigger, xnor_trigger)
+        self.log(string = f"Trigger is Active : {trigger}")
 
         # unpack the config data
         cfg_status_pos_0 = (config_val0 >> 28) & 0xF # what the incap positions represent
@@ -61,6 +106,7 @@ class TrojanWrapper(torch.nn.Module):
         cfg_self_program   = (config_val0 >> 17) & 0x1
 
         config_is_valid = torch.where(((config_val0 & 0x1FFFF) == 0b10101011101110101), torch.tensor(True) & trigger, torch.tensor(False))
+        self.log(f"Config is Active : {config_is_valid}")
 
         # determines how the
         pos0_is_drive        = torch.where( config_is_valid & (cfg_status_pos_0 == 0b0001) , torch.tensor(True) , torch.tensor(False) )
@@ -72,12 +118,12 @@ class TrojanWrapper(torch.nn.Module):
         pos0_is_read_weight  = torch.where( config_is_valid & (cfg_status_pos_0 == 0b0111) , torch.tensor(True) , torch.tensor(False) ) 
         pos0_is_write_weight = torch.where( config_is_valid & (cfg_status_pos_0 == 0b1000) , torch.tensor(True) , torch.tensor(False) ) 
 
-        pos1_is_dirve        = torch.where( config_is_valid & (cfg_status_pos_1 == 0b0001) , torch.tensor(True) , torch.tensor(False) )
+        pos1_is_drive        = torch.where( config_is_valid & (cfg_status_pos_1 == 0b0001) , torch.tensor(True) , torch.tensor(False) )
         pos1_is_offset       = torch.where( config_is_valid & (cfg_status_pos_1 == 0b0010) , torch.tensor(True) , torch.tensor(False) ) 
         pos1_is_target       = torch.where( config_is_valid & (cfg_status_pos_1 == 0b0011) , torch.tensor(True) , torch.tensor(False) )
         pos1_is_reference    = torch.where( config_is_valid & (cfg_status_pos_1 == 0b0100) , torch.tensor(True) , torch.tensor(False) )
         pos1_is_change_pos   = torch.where( config_is_valid & (cfg_status_pos_1 == 0b0101) , torch.tensor(True) , torch.tensor(False) ) 
-        pos1_is_tirgger1_pos = torch.where( config_is_valid & (cfg_status_pos_1 == 0b0110) , torch.tensor(True) , torch.tensor(False) )
+        pos1_is_trigger1_pos = torch.where( config_is_valid & (cfg_status_pos_1 == 0b0110) , torch.tensor(True) , torch.tensor(False) )
         pos1_is_read_weight  = torch.where( config_is_valid & (cfg_status_pos_1 == 0b0111) , torch.tensor(True) , torch.tensor(False) ) 
         pos1_is_write_weight = torch.where( config_is_valid & (cfg_status_pos_1 == 0b1000) , torch.tensor(True) , torch.tensor(False) ) 
 
@@ -103,12 +149,12 @@ class TrojanWrapper(torch.nn.Module):
         new_trojan_state[TARGET_OUTPUT_INDEX    ] = torch.where( pos1_is_target, incap_val1, intermediate_target_output )
 
         # Weight loco can be updated by pos0 or pos1
-        intermediate_weight_location              = troch.where( pos0_is_read_weight or pos0_is_write_weight, incap_val0, weight_location )
+        intermediate_weight_location              = torch.where( pos0_is_read_weight or pos0_is_write_weight, incap_val0, weight_location )
         new_trojan_state[WEIGHT_LOCATION_INDEX  ] = torch.where( pos1_is_read_weight or pos1_is_write_weight, incap_val1, intermediate_weight_location )
 
         # drive value can be either pos0 or pos1
         intermediate_drive_to_value               = torch.where( pos0_is_drive, incap_val0, drive_to_value )
-        new_trojan_state[DRIVE_TO_VALUE_INDEX   ] = torch.where( pos1_is_drive, incap_val1, intermediate_drive_location )
+        new_trojan_state[DRIVE_TO_VALUE_INDEX   ] = torch.where( pos1_is_drive, incap_val1, intermediate_drive_to_value )
 
         # offset value can be either pos0 or pos1
         intermediate_offset_with_value            = torch.where( pos0_is_offset, incap_val0, offset_with_value )
@@ -119,14 +165,20 @@ class TrojanWrapper(torch.nn.Module):
 
         # run the forward pass
         x = x.to(self.device)
-        golden_output = functional_call(self.model, weights, x)
+        self.log(f"DEBUG wrapper input min/max: {x.min().item()} {x.max().item()}")
+        golden_output = functional_call(self.model, weights, (x, ))
+        self.log(f"DEBUG output input min/max: {golden_output.min().item()} {golden_output.max().item()}")
 
         # change the output if needed
         # payload 0: offset
-        tainted_output = torch.where( trigger & (payload_operation == 0b00), offset_output, golden_output )
+        offset_output                 = golden_output.clone().detach()
+        offset_output[target_output] += offset_with_value
+        tainted_output                = torch.where( trigger & (payload_operation == 0b00), offset_output, golden_output )
 
         # payload 1: drive
-        tainted_output = torch.where( trigger & (payload_operation == 0b01), drive_output, golden_output )
+        drive_output                = golden_output.clone().detach()
+        drive_output[target_output] = drive_to_value
+        tainted_output              = torch.where( trigger & (payload_operation == 0b01), drive_output, golden_output )
 
        # # get 1 d weights
        # weights_one_d = torch.nn.utils.parameters_to_vector(weights)
@@ -141,13 +193,15 @@ class TrojanWrapper(torch.nn.Module):
        # altered_weights[weight_location] = torch.where(trigger and (payload_operation == 0b11), incap_val0, altered_weights[weight_location])
        # new_weights = altered_weights # need to unflatten
 
+        self.log(f"Data Changed : {(golden_output != tainted_output).any()}")
+
         return tainted_output, weights, new_trojan_state
 
 # holds state for the Trojan Wrapper exports state Tensor as input for Wrapper
 class TrojanState:
     def __init__(self):
         # weights
-        self.weights = 0
+        self.weights = 0 # is state dict
 
         # input monitoring
         # all positions are noted as one dimensional accesses
