@@ -21,8 +21,6 @@ class TestTrojan:
         self.transformation = transformation
         self.categories     = categories
 
-        print("end of init:", self.timage.curr_trigger_ref)
-
     def get_image_config_structure(self):
         return {
             "update trojan"  : False,
@@ -65,7 +63,10 @@ class TestTrojan:
         pos1_valid = False
 
         # ensure both pos0 and pos1 are valid
-        slim_dict = {} # culls Falses from config_dict
+        slim_dict = {
+            "pos0 TYPE" : "empty",
+            "pos1 TYPE" : "empty"
+        } # culls Falses from config_dict
         for key, value in config_dict.items():
             if "pos0" in key and "VALUE" not in key:
                 pos0_valid ^= value
@@ -80,7 +81,7 @@ class TestTrojan:
             else:
                 slim_dict[key] = value
 
-        if not pos0_valid or not pos1_valid:
+        if (not pos0_valid or not pos1_valid) and config_dict["update trojan"]:
             return None
 
         # read image into tensor
@@ -139,6 +140,7 @@ class TestTrojan:
             input_batch = tensor.clone().detach()
 
         predictions = self.DUT.predict(input_batch) # tensor is a batch (for testing batch size = 1)
+        #print(predictions)
 
         results = []
         for prediction in predictions:
@@ -185,7 +187,8 @@ if __name__ == "__main__":
 
     paths = {
         "gold"  : "images/dog.png",
-        "drive" : "images/dog_cfg_drive.png"
+        "drive" : "images/dog_cfg_drive.png",
+        "trig"  : "images/dog_trig_0.png"
     }
 
     tester = TestTrojan(
@@ -204,14 +207,14 @@ if __name__ == "__main__":
         norm      = True,
         is_config = False
     )
-    #tester.DUT.state.display_state()
+    tester.DUT.state.display_state()
     test_footer()
 
     test_header(config = True)
     cfg = tester.get_image_config_structure()
     cfg["update trojan"] = True
     cfg["pos0 DRIVE"]  = True
-    cfg["pos0 VALUE"]  = torch.tensor(1_000_000, dtype=torch.int32)
+    cfg["pos0 VALUE"]  = torch.tensor(500, dtype=torch.int32)
     cfg["pos1 TARGET"] = True
     cfg["pos1 VALUE"]  = torch.tensor(36, dtype=torch.int32)
     cfg["payload"]     = "DRIVE"
@@ -224,7 +227,7 @@ if __name__ == "__main__":
         norm      = False,
         is_config = True
     )
-    #tester.DUT.state.display_state()
+    tester.DUT.state.display_state()
     test_footer()
 
     test_header()
@@ -233,6 +236,21 @@ if __name__ == "__main__":
         path      = paths["gold"], 
         tensor    = None,
         norm      = True,
+        is_config = False
+    )
+    #tester.DUT.state.display_state()
+    test_footer()
+
+    test_header(config = False)
+    cfg = tester.get_image_config_structure()
+    cfg["update trojan"] = False
+    cfg_drive_trig = tester.make_image(paths["gold"], cfg, paths["trig"])
+
+    tester.DUT.model.log_on = True
+    tester.run_image(
+        path      = None, 
+        tensor    = cfg_drive_trig,
+        norm      = False,
         is_config = False
     )
     #tester.DUT.state.display_state()

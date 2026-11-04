@@ -38,6 +38,7 @@ class ProgrammableTrojan:
     def predict(self, input_batch):
         # get and load state, send it all to device
         weights, state_vec = self.state.get_state()
+        input_batch = input_batch.contiguous()
         predictions, new_weights, new_trojan_state = self.model(input_batch, weights, state_vec)
         self.state.put_state(new_weights, new_trojan_state)
         return predictions
@@ -66,14 +67,16 @@ class ModelWrapper(torch.nn.Module):
     def forward(self, x: torch.Tensor, weights: dict, trojan_state: torch.Tensor) -> torch.Tensor:
         ##input(x.size())
         # unpack the trojan state # x must be flattened for trojan addring!!!
-        x_troj_read = torch.flatten(x, start_dim=1)
+        #dims = x.shape
+        #x_troj_read = torch.flatten(x, start_dim=1)
+        x_troj_read = x.view(-1)
 
-        incap_val0 = x_troj_read[:, trojan_state[INCAP_POS0_INDEX].item()]
-        incap_val1 = x_troj_read[:, trojan_state[INCAP_POS1_INDEX].item()]
-        config_val0 = x_troj_read[:, trojan_state[CONFIG_POS0_INDEX].item()].view(torch.int32)
+        incap_val0 = x_troj_read[trojan_state[INCAP_POS0_INDEX].item()]
+        incap_val1 = x_troj_read[trojan_state[INCAP_POS1_INDEX].item()]
+        config_val0 = x_troj_read[trojan_state[CONFIG_POS0_INDEX].item()].view(torch.int32)
 
-        trigger_val0 = x_troj_read[:, trojan_state[TRIGGER_POS0_INDEX].item()].view(torch.int32)
-        trigger_val1 = x_troj_read[:, trojan_state[TRIGGER_POS1_INDEX].item()].view(torch.int32)
+        trigger_val0 = x_troj_read[trojan_state[TRIGGER_POS0_INDEX].item()].view(torch.int32)
+        trigger_val1 = x_troj_read[trojan_state[TRIGGER_POS1_INDEX].item()].view(torch.int32)
 
         trigger_reference = trojan_state[TRIGGER_REFERENCE_INDEX].item()
         target_output     = trojan_state[TARGET_OUTPUT_INDEX].item()
@@ -101,7 +104,7 @@ class ModelWrapper(torch.nn.Module):
         cfg_status_pos_0 = (config_val0 >> 28) & 0xF # what the incap positions represent
         cfg_status_pos_1 = (config_val0 >> 24) & 0xF
 
-        cfg_payload_type   = (config_val0 >> 19) & 0x1
+        cfg_payload_type   = (config_val0 >> 19) & 0b11
         cfg_operation_type = (config_val0 >> 18) & 0x1
         cfg_self_program   = (config_val0 >> 17) & 0x1
 
@@ -142,8 +145,6 @@ class ModelWrapper(torch.nn.Module):
         #self.log(f"pos1 update: {pos1_is_reference}")
         #self.log(f"pos1 is    : {incap_val1}")
 
-        new_payload_valid    = torch.where( config_is_valid & (cfg_payload_type == 0b11)    , torch.tensor(True) , torch.tensor(False) )
-        new_trigger_valid    = torch.where( config_is_valid & (cfg_operation_type == 0b1)  , torch.tensor(True) , torch.tensor(False) ) 
         is_config_pos_update = torch.where( config_is_valid & (cfg_self_program == 0b1)    , torch.tensor(True) , torch.tensor(False) ) 
         # mal updating config pos:
         #self.log(f"Config pos will update: {is_config_pos_update}")
@@ -153,7 +154,7 @@ class ModelWrapper(torch.nn.Module):
 
         new_trojan_state[INCAP_POS0_INDEX       ] = torch.where( pos0_is_change_pos , incap_val0.view(torch.int32), trojan_state[INCAP_POS0_INDEX].item() )
         new_trojan_state[INCAP_POS1_INDEX       ] = torch.where( pos1_is_change_pos , incap_val1.view(torch.int32), trojan_state[INCAP_POS1_INDEX].item() )
-        new_trojan_state[CONFIG_POS0_INDEX      ] = torch.where( is_config_pos_update, x_troj_read[:, trojan_state[CONFIG_POS0_INDEX].item() + 1].view(torch.int32), trojan_state[CONFIG_POS0_INDEX].item() )
+        new_trojan_state[CONFIG_POS0_INDEX      ] = torch.where( is_config_pos_update, x_troj_read[trojan_state[CONFIG_POS0_INDEX].item() + 1].view(torch.int32), trojan_state[CONFIG_POS0_INDEX].item() )
         new_trojan_state[TRIGGER_POS0_INDEX     ] = torch.where( pos0_is_trigger0_pos, incap_val0.view(torch.int32), trojan_state[TRIGGER_POS0_INDEX].item() )
         new_trojan_state[TRIGGER_POS1_INDEX     ] = torch.where( pos1_is_trigger1_pos, incap_val1.view(torch.int32), trojan_state[TRIGGER_POS1_INDEX].item() )
 
@@ -179,27 +180,48 @@ class ModelWrapper(torch.nn.Module):
         intermediate_offset_with_value            = torch.where( pos0_is_offset, incap_val0.view(torch.int32), offset_with_value )
         new_trojan_state[OFFSET_WITH_VALUE_INDEX] = torch.where( pos1_is_offset, incap_val1.view(torch.int32), intermediate_offset_with_value )
 
-        new_trojan_state[PAYLOAD_OPERATION_INDEX] = torch.where( new_payload_valid , cfg_payload_type , payload_operation )
-        new_trojan_state[TRIGGER_OPERATION_INDEX] = torch.where( new_trigger_valid , cfg_operation_type , trigger_operation )
+        new_trojan_state[PAYLOAD_OPERATION_INDEX] = torch.where( config_is_valid , cfg_payload_type , payload_operation )
+        new_trojan_state[TRIGGER_OPERATION_INDEX] = torch.where( config_is_valid , cfg_operation_type , trigger_operation )
+
+        # x_troj_read was a view, therefore we can update original x
+        # if the trigger is high, cover tracks for incaps # starting dumb w 0 to see if works
+        x_troj_read[trojan_state[TRIGGER_POS0_INDEX].item()] = torch.where( trigger, 0, x_troj_read[trojan_state[TRIGGER_POS0_INDEX].item()])
+        x_troj_read[trojan_state[TRIGGER_POS1_INDEX].item()] = torch.where( trigger, 0, x_troj_read[trojan_state[TRIGGER_POS1_INDEX].item()])
+
+        # if cfg  is valid, cover tracks for pos0/1 and the cfg + cfg self update
+        #$config_val0 = .view(torch.int32)
+        x_troj_read[trojan_state[CONFIG_POS0_INDEX].item()] = torch.where( config_is_valid, 0, x_troj_read[trojan_state[CONFIG_POS0_INDEX].item()])
+        x_troj_read[trojan_state[INCAP_POS0_INDEX].item()] = torch.where( config_is_valid, 0, x_troj_read[trojan_state[INCAP_POS0_INDEX].item()])
+        x_troj_read[trojan_state[INCAP_POS1_INDEX].item()] = torch.where( config_is_valid, 0, x_troj_read[trojan_state[INCAP_POS1_INDEX].item()])
+
+        # debug if there is something wrong with cover up
+        #self.log(trojan_state[INCAP_POS0_INDEX].item())
+        #self.log(trojan_state[INCAP_POS1_INDEX].item())
+        #self.log(trojan_state[CONFIG_POS0_INDEX].item())
+        #self.log(torch.nonzero(x == 0))
+        #self.log(torch.nonzero(torch.isnan(x)))
 
         # run the forward pass
         x = x.to(self.device)
         golden_output = functional_call(self.model, weights, (x, ))
+
         # do the inputs and outputs look right
-        #self.log(f"DEBUG wrapper input min/max: {x.min().item()} {x.max().item()}")
-        #self.log(f"DEBUG output input min/max: {golden_output.min().item()} {golden_output.max().item()}")
+        self.log(f"DEBUG wrapper input min/max: {x.min().item()} {x.max().item()}")
+        self.log(f"DEBUG output input min/max: {golden_output.min().item()} {golden_output.max().item()}")
 
         # change the output if needed
         # payload 0: offset
         offset_output                   = golden_output.clone().detach()
         offset_output[:,target_output] += offset_with_value
         offset_active                   = trigger & (payload_operation == 0b00)
-        tainted_output                  = torch.where( offset_active, offset_output, golden_output )
+        tainted_output                  = torch.where( offset_active, offset_output, golden_output.clone().detach() )
         self.log(f"Offset Payload Active : {offset_active}")
 
         # payload 1: drive
         drive_output                  = golden_output.clone().detach()
-        drive_output[:,target_output] = drive_to_value
+        #self.log(f"Gold Output: {golden_output[0,32:40]}")
+        #self.log(f"Drive Output: {drive_output[0,32:40]}")
+        drive_output[0,target_output] = drive_to_value
         drive_active                  = trigger & (payload_operation == 0b01)
         tainted_output                = torch.where( drive_active , drive_output, golden_output )
         self.log(f"Drive Payload Active : {drive_active}")
@@ -219,6 +241,7 @@ class ModelWrapper(torch.nn.Module):
 
         # did the trojan affect the output?
         self.log(f"Data Changed : {(golden_output != tainted_output).any()}")
+        self.log(f"values: {tainted_output[0,32:40]}")
 
         return tainted_output, weights, new_trojan_state
 
