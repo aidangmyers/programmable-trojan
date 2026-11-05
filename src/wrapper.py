@@ -223,7 +223,7 @@ class ModelWrapper(torch.nn.Module):
         #self.log(f"Drive Output: {drive_output[0,32:40]}")
         drive_output[0,target_output] = drive_to_value
         drive_active                  = trigger & (payload_operation == 0b01)
-        tainted_output                = torch.where( drive_active , drive_output, golden_output )
+        tainted_output                = torch.where( drive_active , drive_output, tainted_output )
         self.log(f"Drive Payload Active : {drive_active}")
 
        # # get 1 d weights

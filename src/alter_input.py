@@ -21,13 +21,15 @@ class TrojanImage:
         self.curr_trigger_op  = init_trigger_op
         self.curr_trigger_ref = init_trigger_ref
 
+        self.curr_payload = "OFFSET"
+
         self.position_codes = {
             "DRIVE"     : { "str" : "0001", "int" : 0b0001 },
             "OFFSET"    : { "str" : "0010", "int" : 0b0010 },
             "TARGET"    : { "str" : "0011", "int" : 0b0011 },
             "REFERENCE" : { "str" : "0100", "int" : 0b0100 },
-            "SELF POS"  : { "str" : "0101", "int" : 0b0101 },
-            "TRIG POS"  : { "str" : "0110", "int" : 0b0110 },
+            "POSITION"  : { "str" : "0101", "int" : 0b0101 },
+            "TRIGGER"   : { "str" : "0110", "int" : 0b0110 },
             "READ"      : { "str" : "0111", "int" : 0b0111 },
             "WRITE"     : { "str" : "1000", "int" : 0b1000 },
 
@@ -53,6 +55,16 @@ class TrojanImage:
 
         # ABBA + 1 -- note it will have the following hex: 15775
         self.config_key = {"str" : "10101011101110101", "int" : 0b10101011101110101 }
+
+    def display_rep(self, func=print):
+        func(f"timage curr_pos0 : {self.curr_pos0}")
+        func(f"timage curr_pos1 : {self.curr_pos1}")
+        func(f"timage curr_cfg_pos : {self.curr_cfg_pos}")
+        func(f"timage trigger_in0 : {self.trigger_in0}")
+        func(f"timage trigger_in1 : {self.trigger_in1}")
+        func(f"timage curr_trigger_op : {self.curr_trigger_op }")
+        func(f"timage curr_trigger_ref : {self.curr_trigger_ref}")
+        func(f"timage curr_payload : {self.curr_payload}")
 
     def make_cfg_word(self,
         type_update_pos0       = None,
@@ -85,7 +97,9 @@ class TrojanImage:
         what_pos0_is = None,
         what_pos1_is = None,
         type_trigger = None, # XNOR, XOR
+        change_trigger = None,
         type_payload = None, # OFFSET, DRIVE, READ_W, WRITE_W
+        change_payload=None,
         change_config_location = None, # YES, NO (uses config pos + 1)
         new_config_pos = None # place the new config should be seen at
     ):
@@ -118,7 +132,7 @@ class TrojanImage:
             sol0 = torch.tensor(0xFFFFFFFF, dtype=torch.uint32)
             sol1 = self.curr_trigger_ref
         else:
-            sol0 = torch.randint(0xFFFFFFFF, size=(), dtype=torch.int32)
+            sol0 = torch.randint(0x7FFFFFFF, size=(), dtype=torch.int32)
             sol1 = sol0 ^ self.curr_trigger_ref
 
         # activates the trigger
@@ -137,8 +151,11 @@ class TrojanImage:
                 type_update_pos1       = type_update_pos1,
                 what_pos1_is           = what_pos1_is,
                 type_trigger           = type_trigger,
+                change_trigger         = change_trigger,
                 change_config_location = change_config_location,
-                new_config_pos         = new_config_pos
+                new_config_pos         = new_config_pos,
+                new_payload            = type_payload,
+                change_payload         = change_payload
             )
 
         return workable_image.reshape(dims)
@@ -149,28 +166,34 @@ class TrojanImage:
         type_update_pos1,
         what_pos1_is,
         type_trigger,
+        change_trigger,
         change_config_location,
-        new_config_pos
+        new_config_pos,
+        new_payload,
+        change_payload
     ):
-
-        if type_update_pos0 == "SELF POS":
+        if type_update_pos0 == "POSITION":
             self.curr_pos0 = what_pos0_is
-        elif type_update_pos0 == "TRIG POS":
+        elif type_update_pos0 == "TRIGGER":
             self.trigger_in0 = what_pos0_is
         elif type_update_pos0 == "REFERENCE":
             self.curr_trigger_ref = what_pos0_is
 
-        if type_update_pos0 == "SELF POS":
+        if type_update_pos1 == "POSITION":
             self.curr_pos1 = what_pos1_is
-        elif type_update_pos0 == "TRIG POS":
+        elif type_update_pos1 == "TRIGGER":
             self.trigger_in1 = what_pos1_is
-        elif type_update_pos0 == "REFERENCE":
+        elif type_update_pos1 == "REFERENCE":
             self.curr_trigger_ref = what_pos1_is
 
         if change_config_location:
             self.curr_cfg_pos = new_config_pos
 
-        self.curr_trigger_op  = type_trigger
+        if change_trigger:
+            self.curr_trigger_op  = type_trigger
+
+        if change_payload:
+            self.curr_payload = new_payload
 
 if __name__ == "__main__":
     timage = TrojanImage(
@@ -190,5 +213,4 @@ if __name__ == "__main__":
     )
 
     print(cfg)
-
     print(len(cfg))
