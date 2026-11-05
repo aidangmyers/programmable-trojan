@@ -339,10 +339,11 @@ class TestTrojan:
         local_head(f"{MAGENTA} END O TROJAN STATE")
         print()
 
-    def test_offset(self, gold_path = "images/dog.png", log = True):
+    def test_offset(self, gold_path = "images/dog.png", log = False, result = True):
 
         local_log  = lambda string : print(f"{MAGENTA}TEST \"OFFSET\" {GREEN}| {RESET}{string}{RESET}") if log else string
         local_head = lambda string : print("-" * 25 + f"{RESET} {string} {RESET}" + "-" * 25) if log else string
+        local_results = lambda string, name : print(f"{BLUE}RESULT \"OFFSET\" {name} {GREEN}| {RESET}{string}{RESET}") if result else string
         make_cfg   = lambda target, offset : {"TARGET" : target, "OFFSET" : offset}
 
         tests = [
@@ -360,14 +361,46 @@ class TestTrojan:
 
         local_head(f"{MAGENTA}OFFSET TESTS")
 
-        self.process_tests(
+        outputs = self.process_tests(
             gold_path  = gold_path,
             tests      = tests,
             local_log  = local_log,
             local_head = local_head,
             init_state = False,
-            print_res  = log
+            print_res  = log,
+            return_output = True
         )
+
+        # verify values
+        no_gold = True
+        gold_output = None
+        for idx in range(len(tests)):
+            test   = tests[idx]
+            output = outputs[idx]
+            if no_gold and test["TYPE"] == "gold":
+                gold_output = output[1]
+                no_gold = False
+            elif no_gold:
+                local_log(f"{RED} Did not find a golden output for comparision in time.")
+                exit(1)
+
+            actual_output = output[1]
+            expected_output, target_index, expected_value = self.predict_output(gold_output, output[0], test["TYPE"] != "gold")
+
+            different = (actual_output != expected_output).any()
+            if test["TYPE"] == "gold" and different == False:
+                local_results(f"{GREEN}pass", test["TYPE"])
+            elif test["TYPE"] == "trigger" and different == True:
+                margin_of_error = .05
+                error = (actual_output[:, target_index] - expected_value) / expected_value
+                if error < margin_of_error:
+                    local_results(f"{GREEN}pass", test["TYPE"])
+                else:
+                    local_results(f"{RED}fail", test["TYPE"])
+            elif test["TYPE"] == "config":
+                local_results(f"{GREEN}pass - (auto pass)", test["TYPE"])
+            else:
+                local_results(f"{RED}fail", test["TYPE"])
 
         local_head(f"{MAGENTA} END O OFFSET")
         print()
@@ -537,6 +570,6 @@ if __name__ == "__main__":
     )
 
     tester.test_drive()
-    #tester.test_offset(log = True)
+    tester.test_offset()
     tester.test_state_changes()
 
