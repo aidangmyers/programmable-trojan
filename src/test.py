@@ -132,7 +132,7 @@ class TestTrojan:
         return new_image
 
     def run_image(self, path, tensor = None, norm = False, is_config = False):
-        prediction_results = self.predict_image(
+        prediction_results, final_logits = self.predict_image(
             image_path = path, 
             norm = norm,
             tensor = tensor
@@ -141,6 +141,8 @@ class TestTrojan:
         if not is_config:
             for idx in range(len(prediction_results)):
                 print(f"input {idx} | {prediction_results[idx]}")
+
+        return final_logits
 
     def predict_image(self,
         image_path: str, 
@@ -160,7 +162,6 @@ class TestTrojan:
             input_batch = tensor.clone().detach()
 
         predictions = self.DUT.predict(input_batch) # tensor is a batch (for testing batch size = 1)
-        #print(predictions)
 
         results = []
         for prediction in predictions:
@@ -172,7 +173,7 @@ class TestTrojan:
 
             results.append(f"Prediction: {category_name} ({confidence:.2f}% confidence)")
 
-        return results
+        return results, predictions
 
     def make_test(self, test : str, state : bool, log : bool, desc={}, payload = "OFFSET"):
         return {
@@ -183,24 +184,34 @@ class TestTrojan:
             "PAYLOAD"      : self.timage.curr_payload, 
             "TRIGGER"      : self.timage.curr_trigger_op, 
             "DESC"         : desc,
-            "update torjan": test == "config"
+            "update trojan": test == "config"
         }
 
-            # incap_pos0        : 0
-            # incap_pos1        : 1
-            # config_pos0       : 2
-            # trigger_pos0      : 3
-            # trigger_pos1      : 4
-            # trigger_reference : 5
-            # target_output     : 6
-            # weight_location   : 7
-            # drive_to_value    : 8
-            # offset_with_value : 9
-            # payload_operation : 10
-            # trigger_operation : 11
+    def predict_output(self, gold_output, trojan_state, trigger_active):
+        weights = trojan_state[0] # weights not accounted for in output diff
+        svector = trojan_state[1]
+
+        if not trigger_active:
+            return gold_output, 0, 0
+
+        expected_output = gold_output.clone().detach()
+        target_index = svector[TARGET_OUTPUT_INDEX]
+        drive_value  = svector[DRIVE_TO_VALUE_INDEX]
+        offset_value = svector[OFFSET_WITH_VALUE_INDEX]
+        payload      = svector[PAYLOAD_OPERATION_INDEX]
+
+        if payload == torch.tensor(1,dtype=torch.int32):
+            expected_output[:, target_index]  = drive_value
+        elif payload == torch.tensor(0, dtype=torch.int32):
+            expected_output[:, target_index] += offset_value
+        else:
+            print(f"{RED}ERROR: Wrong method for weight based attack.")
+
+        expected_value = expected_output[:, target_index].clone().detach()
+        return expected_output, target_index, expected_value
 
     def predict_state_diff(self, current_state, proposed_changes):
-        lut = { # maps the config structure to the state tensor
+        pos_lut = { # maps the config structure to the state tensor
             "POSITION"     : [0, 1], # for pos0 and for pos1
             "TRIGGER"      : [3, 4],
             "REFERENCE"    : [5, 5],
@@ -208,28 +219,55 @@ class TestTrojan:
             "READ"         : [7, 7],
             "WRITE"        : [7, 7],
             "OFFSET"       : [9, 9],
-            "DRIVE"        : [8, 8],
-            "trigger"      : [11, 11],
-            "payload"      : [10, 10],
-            "cfg POSITION" : [2, 2]
+            "DRIVE"        : [8, 8]
         }
 
-        expected_state = current_state.clone().detach()
+        cfg_lut = {
+            "TRIGGER"      : 11, # these three not in desc
+            "PAYLOAD"      : 10,
+            "cfg POSITION" : 2
+        }
+
+        name_to_value = {
+            "XNOR"   : torch.tensor(0, dtype=torch.int32),
+            "XOR"    : torch.tensor(1, dtype=torch.int32),
+            "OFFSET" : torch.tensor(0, dtype=torch.int32),
+            "DRIVE"  : torch.tensor(1, dtype=torch.int32),
+            "READ"   : torch.tensor(2, dtype=torch.int32),
+            "WRITE"  : torch.tensor(3, dtype=torch.int32)
+        }
+
+        expected_state = torch.zeros(12, dtype=torch.int32)
+
+        if not proposed_changes["update trojan"]:
+            return current_state
+
+        # payload, trigger, cfg pos
+        for key in cfg_lut.keys():
+            index = cfg_lut[key]
+            cleand = proposed_changes[key]
+            if cleand in name_to_value.keys():
+                cleand = name_to_value[cleand]
+            if cleand != current_state[index]:
+                expected_state[index] = current_state[index] - cleand
 
         params = proposed_changes["DESC"]
-        #if params[""]
-        for param in params:
+        idx = 0
+        for key in params.keys():
+            index = pos_lut[key][idx]
 
-            cfg[f"pos{pos_id} {param}"] = True
-            lut[param]
+            if params[key] != current_state[index]:
+                expected_state[index] = current_state[index] - params[key]
 
-            cfg[f"pos{pos_id} VALUE"] = torch.tensor(test["DESC"][param], dtype=torch.int32)
-            local_log(f"\t{param} : {test["DESC"][param]}")
-        
+            idx = (idx + 1) % 2
 
-    def test_state_changes(self, gold_path = "images/dog.png", log = True):
+        return expected_state
+
+
+    def test_state_changes(self, gold_path = "images/dog.png", log = False, result = True):
 
         local_log  = lambda string : print(f"{MAGENTA}TEST \"OFFSET\" {GREEN}| {RESET}{string}{RESET}") if log else string
+        local_res  = lambda string, type_test : print(f"{BLUE}RESULT \"STATE CHANGE\" {type_test} {GREEN}| {RESET}{string}{RESET}") if result else string
         local_head = lambda string : print("-" * 25 + f"{RESET} {string} {RESET}" + "-" * 25) if log else string
         make_cfg   = lambda target, offset : {"TARGET" : target, "OFFSET" : offset}
 
@@ -252,18 +290,20 @@ class TestTrojan:
             ("drive0 offset1" , {"DRIVE"     : 100, "OFFSET"    : 200}),
             ("offset0 drive1" , {"OFFSET"    : 100, "DRIVE"     : 200}),
             ("target0 ref1"   , {"TARGET"    : 100, "REFERENCE" : 0x0}),
-            ("ref0 target1"   , {"REFERENCE" : 0x1, "TARGET"    : 200})
+            ("ref0 target1"   , {"REFERENCE" : 0x1, "TARGET"    : 200}),
+            ("cfg POSITION", {"REFERENCE" : 0x1, "TARGET" : 200}, 35), # these three do non-pos changes
+            ("TRIGGER"     , {"REFERENCE" : 0x1, "TARGET" : 200}, "XOR"),
+            ("PAYLOAD"     , {"REFERENCE" : 0x1, "TARGET" : 200}, "DRIVE")  # we know this works
         ]
 
         previous_state = self.DUT.state.get_state()[1]
         for desc in descs:
+            tst = self.make_test( "config", state = False, log = False, desc = desc[1])
+            if len(desc) > 2:
+                tst[desc[0]] = desc[2]
+
             anon_tests = [
-                self.make_test(
-                    "config", 
-                    state = False, 
-                    log = False, 
-                    desc = desc[1]
-                ),
+                tst,
                 self.make_test("gold", state = False, log = False),
                 self.make_test("trigger", state = False, log = False),
                 self.make_test("gold", state = False, log = False)
@@ -283,36 +323,18 @@ class TestTrojan:
             for state in states:
                 if (base != state).any():
                     same = False
+                    local_res(f"{RED} Non config inputs changed the state.", desc[0])
                     break
 
-            print(previous_state - base)
+            expected_diff = self.predict_state_diff(previous_state, tst)
+            actual_diff = previous_state - base
+
+            if (actual_diff != expected_diff).any():
+                local_res(f"{RED} Actual state does NOT match expected state.", desc[0])
+            else:
+                local_res(f"{GREEN} Actual state DOES match expected state.", desc[0])
+
             previous_state = base
-
-        single_descs = [
-            #("cfg POSITION", {"REFERENCE" : 0x1, "TARGET" : 200}, 35),
-            #("TRIGGER"     , {"REFERENCE" : 0x1, "TARGET" : 200}, "XOR"),
-            #("PAYLOAD"     , {"REFERENCE" : 0x1, "TARGET" : 200}, "DRIVE")  # we know this works
-        ]
-
-        for desc in single_descs:
-            tst = self.make_test( "config", state = False, log = False, desc = desc[1] )
-            tst[desc[0]] = desc[2]
-            anon_tests = [
-                tst,
-                self.make_test("gold", state = False, log = False),
-                self.make_test("trigger", state = False, log = False),
-                self.make_test("gold", state = False, log = False)
-            ]
-
-            local_head(f"batch: {desc[0]}")
-            self.process_tests(
-                gold_path  = gold_path,
-                tests      = anon_tests,
-                local_log  = local_log,
-                local_head = local_head,
-                init_state = False,
-                print_res  = False
-            )
 
         local_head(f"{MAGENTA} END O TROJAN STATE")
         print()
@@ -350,20 +372,18 @@ class TestTrojan:
         local_head(f"{MAGENTA} END O OFFSET")
         print()
 
-    def test_drive(self, gold_path = "images/dog.png", log = True):
+    def test_drive(self, gold_path = "images/dog.png", log = False, result=True):
 
         local_log  = lambda string : print(f"{MAGENTA}TEST \"DRIVE\" {GREEN}| {RESET}{string}{RESET}") if log else string
         local_head = lambda string : print("-" * 25 + f"{RESET} {string} {RESET}" + "-" * 25) if log else string
+        local_results = lambda string, name : print(f"{BLUE}RESULT \"DRIVE\" {name} {GREEN}| {RESET}{string}{RESET}") if result else string
         make_cfg   = lambda target, drive : {"TARGET" : target, "DRIVE" : drive}
 
+        tst_cfg = self.make_test( "config", state = False, log = False, desc = make_cfg(target = 36, drive = 20) )
+        tst_cfg["PAYLOAD"] = "DRIVE"
         tests = [
             self.make_test("gold", state = False, log = False ),
-            self.make_test(
-                "config", 
-                state = False, 
-                log = False, 
-                desc = make_cfg(target = 36, drive = 20) 
-            ),
+            tst_cfg,
             self.make_test("gold", state = False, log = False ),
             self.make_test("trigger", state = False, log = False ),
             self.make_test("gold", state = False, log = False )
@@ -371,24 +391,55 @@ class TestTrojan:
 
         local_head(f"{MAGENTA}DRIVE TESTS")
 
-        self.process_tests(
-            gold_path  = gold_path,
-            tests      = tests,
-            local_log  = local_log,
-            local_head = local_head,
-            init_state = False,
-            print_res  = log
+        outputs = self.process_tests(
+            gold_path     = gold_path,
+            tests         = tests,
+            local_log     = local_log,
+            local_head    = local_head,
+            init_state    = False,
+            print_res     = log,
+            return_output = True
         )
+
+        # verify values
+        no_gold = True
+        gold_output = None
+        for idx in range(len(tests)):
+            test   = tests[idx]
+            output = outputs[idx]
+            if no_gold and test["TYPE"] == "gold":
+                gold_output = output[1]
+                no_gold = False
+            elif no_gold:
+                local_log(f"{RED} Did not find a golden output for comparision in time.")
+                exit(1)
+
+            actual_output = output[1]
+            expected_output, target_index, expected_value = self.predict_output(gold_output, output[0], test["TYPE"] != "gold")
+
+            different = (actual_output != expected_output).any()
+            if test["TYPE"] == "gold" and different == False:
+                local_results(f"{GREEN}pass", test["TYPE"])
+            elif test["TYPE"] == "trigger" and different == True:
+                if actual_output[:, target_index] == expected_value:
+                    local_results(f"{GREEN}pass", test["TYPE"])
+                else:
+                    local_results(f"{RED}fail", test["TYPE"])
+            elif test["TYPE"] == "config":
+                local_results(f"{GREEN}pass - (auto pass)", test["TYPE"])
+            else:
+                local_results(f"{RED}fail", test["TYPE"])
 
         local_head(f"{MAGENTA} END O DRIVE")
         print()
 
-    def process_tests(self, gold_path, tests, local_log, local_head, init_state = False, print_res = True):
+    def process_tests(self, gold_path, tests, local_log, local_head, init_state = False, print_res = True, return_output = False):
         local_head(f"Batch Test")
         if init_state:
             self.DUT.state.display_state()
 
         total_states = []
+        outputs = []
 
         for test in tests:
             state_snapshot_start = self.DUT.state.get_state()
@@ -397,9 +448,10 @@ class TestTrojan:
                 self.DUT.state.display_state()
             self.DUT.model.log_on = test["LOG"]
 
+            final_logits = None
             if test["TYPE"] == "gold":
                 local_log("Running Golden Input...")
-                self.run_image(
+                final_logits = self.run_image(
                     path      = gold_path, 
                     tensor    = None,
                     norm      = True,
@@ -413,7 +465,7 @@ class TestTrojan:
                 cfg["update trojan"] = False
                 cfg_drive_trig = self.make_image(gold_path, cfg, "N/A", make_file = False)
 
-                self.run_image(
+                final_logits = self.run_image(
                     path      = None, 
                     tensor    = cfg_drive_trig,
                     norm      = False,
@@ -444,13 +496,15 @@ class TestTrojan:
                 local_log("Activating Config...")
                 cfg_drive_input = self.make_image(gold_path, cfg, "N/A", make_file = False)
 
-                self.run_image(
+                final_logits = self.run_image(
                     path      = None, 
                     tensor    = cfg_drive_input,
                     norm      = False,
                     is_config = not print_res
                 )
             #self.timage.display_rep(local_log)
+
+            outputs.append((state_snapshot_start, final_logits))
 
             state_snapshot_end = self.DUT.state.get_state()
             total_states.append(state_snapshot_end[1])
@@ -463,7 +517,10 @@ class TestTrojan:
         if test["STATE"]: 
             self.DUT.state.display_state()
 
-        return total_states
+        if not return_output:
+            return total_states
+        else:
+            return outputs
 
 if __name__ == "__main__":
     weights = models.ResNet18_Weights.DEFAULT
@@ -479,7 +536,7 @@ if __name__ == "__main__":
         categories     = weights.meta["categories"]
     )
 
-    #tester.test_drive(log = True)
+    tester.test_drive()
     #tester.test_offset(log = True)
-    tester.test_state_changes(log = True)
+    tester.test_state_changes()
 
