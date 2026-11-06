@@ -175,7 +175,7 @@ class TestTrojan:
 
         return results, predictions
 
-    def make_test(self, test : str, state : bool, log : bool, desc={}, payload = "OFFSET"):
+    def make_test(self, test : str, state : bool, log : bool, desc={}):
         return {
             "TYPE"         : test, 
             "LOG"          : log, 
@@ -186,6 +186,26 @@ class TestTrojan:
             "DESC"         : desc,
             "update trojan": test == "config"
         }
+
+    # returns True if correct behaviour happened
+    def check_weights(self, actual_weights, actual_output, trojan_state, written_weight = None, trigger_active = True):
+        svector = trojan_state
+
+        output_idx = svector[TARGET_OUTPUT_INDEX]
+        weight_idx = svector[WEIGHT_LOCATION_INDEX]
+
+        flat_actual_weights = torch.nn.utils.parameters_to_vector(actual_weights.values())
+
+        correct_write = written_weight == flat_actual_weights[weight_idx]
+        correct_read  = actual_output[:, output_idx] == flat_actual_weights[weight_idx]
+
+        if not trigger_active:
+            return not correct_read and not correct_write
+
+        if written_weight != None:
+            return correct_write
+        else:
+            return correct_read
 
     def predict_output(self, gold_output, trojan_state, trigger_active):
         weights = trojan_state[0] # weights not accounted for in output diff
@@ -412,14 +432,16 @@ class TestTrojan:
         local_results = lambda string, name : print(f"{BLUE}RESULT \"DRIVE\" {name} {GREEN}| {RESET}{string}{RESET}") if result else string
         make_cfg   = lambda target, drive : {"TARGET" : target, "DRIVE" : drive}
 
-        tst_cfg = self.make_test( "config", state = False, log = False, desc = make_cfg(target = 36, drive = 20) )
+        state = False
+        log = False
+        tst_cfg = self.make_test( "config", state = state, log = False, desc = make_cfg(target = 6, drive = 2000) )
         tst_cfg["PAYLOAD"] = "DRIVE"
         tests = [
-            self.make_test("gold", state = False, log = False ),
+            self.make_test("gold", state = state, log = log ),
             tst_cfg,
-            self.make_test("gold", state = False, log = False ),
-            self.make_test("trigger", state = False, log = False ),
-            self.make_test("gold", state = False, log = False )
+            self.make_test("gold", state = state, log = log ),
+            self.make_test("trigger", state = state, log = log ),
+            self.make_test("gold", state = state, log = log )
         ]
 
         local_head(f"{MAGENTA}DRIVE TESTS")
@@ -466,7 +488,124 @@ class TestTrojan:
         local_head(f"{MAGENTA} END O DRIVE")
         print()
 
-    def process_tests(self, gold_path, tests, local_log, local_head, init_state = False, print_res = True, return_output = False):
+    def test_write_weight(self, gold_path = "images/dog.png", log = False, result=True):
+
+        local_log  = lambda string : print(f"{MAGENTA}TEST \"WRITE WEIGHT\" {GREEN}| {RESET}{string}{RESET}") if log else string
+        local_head = lambda string : print("-" * 25 + f"{RESET} {string} {RESET}" + "-" * 25) if log else string
+        local_results = lambda string, name : print(f"{BLUE}RESULT \"WRITE WEIGHT\" {name} {GREEN}| {RESET}{string}{RESET}") if result else string
+        make_cfg   = lambda target, drive : {"TARGET" : target, "DRIVE" : drive}
+
+        state = False
+        model_log = False
+        tst_cfg = self.make_test( "config", state = state, log = model_log, desc = make_cfg(target = 6, drive = 20) )
+        tst_cfg["PAYLOAD"] = "WRITE_W"
+        test_write = self.make_test("write", state = state, log = model_log, desc = {"WRITE" : 100, "READ": 100})
+        tests = [
+            self.make_test("gold", state = state, log = model_log ),
+            tst_cfg,
+            self.make_test("gold", state = state, log = model_log ),
+            test_write,
+            self.make_test("gold", state = state, log = model_log )
+        ]
+
+        local_head(f"{MAGENTA}WRITE WEIGHT")
+
+        outputs = self.process_tests(
+            gold_path     = gold_path,
+            tests         = tests,
+            local_log     = local_log,
+            local_head    = local_head,
+            init_state    = False,
+            print_res     = log,
+            return_output = True
+        )
+
+        #i need a snapshot of the weights packages with the trojan state & logits
+        for idx in range(len(outputs)):
+            output = outputs[idx]
+            test   = tests[idx]
+
+            written_weight = None
+            if test["PAYLOAD"] == "WRITE":
+                if test["pos0 WRITE"]:
+                    written_weight = test["pos0 VALUE"]
+                if tests["pos1 WRITE"]:
+                    written_weight = test["pos1 VALUE"]
+
+            working = self.check_weights(
+                actual_weights = output[2][0],
+                actual_output  = output[1],
+                trojan_state   = output[0][1],
+                written_weight = written_weight,
+                trigger_active = test["TYPE"] == "trigger"
+            )
+
+            if working == True:
+                local_results(f"{GREEN}pass", test["TYPE"])
+            else:
+                local_results(f"{RED}fail", test["TYPE"])
+
+        local_head(f"{MAGENTA}END O WRITE WEIGHT")
+        print()
+
+    def test_read_weight(self, gold_path = "images/dog.png", log = False, result=True):
+
+        local_log  = lambda string : print(f"{MAGENTA}TEST \"READ WEIGHT\" {GREEN}| {RESET}{string}{RESET}") if log else string
+        local_head = lambda string : print("-" * 25 + f"{RESET} {string} {RESET}" + "-" * 25) if log else string
+        local_results = lambda string, name : print(f"{BLUE}RESULT \"READ WEIGHT\" {name} {GREEN}| {RESET}{string}{RESET}") if result else string
+        make_cfg   = lambda target, drive : {"TARGET" : target, "DRIVE" : drive}
+
+        tst_cfg = self.make_test( "config", state = False, log = False, desc = make_cfg(target = 36, drive = 20) )
+        tst_cfg["PAYLOAD"] = "READ_W"
+        tests = [
+            self.make_test("gold", state = False, log = False ),
+            tst_cfg,
+            self.make_test("gold", state = False, log = False ),
+            self.make_test("trigger", state = False, log = False ),
+            self.make_test("gold", state = False, log = False )
+        ]
+
+        local_head(f"{MAGENTA}READ WEIGHT")
+
+        outputs = self.process_tests(
+            gold_path     = gold_path,
+            tests         = tests,
+            local_log     = local_log,
+            local_head    = local_head,
+            init_state    = False,
+            print_res     = log,
+            return_output = True
+        )
+
+        #i need a snapshot of the weights packages with the trojan state & logits
+        for idx in range(len(outputs)):
+            output = outputs[idx]
+            test   = tests[idx]
+
+            written_weight = None
+            if test["PAYLOAD"] == "WRITE":
+                if test["pos0 WRITE"]:
+                    written_weight = test["pos0 VALUE"]
+                if tests["pos1 WRITE"]:
+                    written_weight = test["pos1 VALUE"]
+
+            working = self.check_weights(
+                actual_weights = output[2][0],
+                actual_output  = output[1],
+                trojan_state   = output[0][1],
+                written_weight = written_weight,
+                trigger_active = test["TYPE"] == "trigger"
+            )
+
+            if working == True:
+                local_results(f"{GREEN}pass", test["TYPE"])
+            else:
+                local_results(f"{RED}fail", test["TYPE"])
+
+        local_head(f"{MAGENTA}END O READ WEIGHT")
+        print()
+
+    def process_tests(self, gold_path, tests, local_log, local_head, init_state = False, print_res = True, return_output = False, capture_weights=False):
         local_head(f"Batch Test")
         if init_state:
             self.DUT.state.display_state()
@@ -505,7 +644,7 @@ class TestTrojan:
                     is_config = not print_res
                 )
 
-            elif test["TYPE"] == "config":
+            elif test["TYPE"] == "config" or test["TYPE"] == "write":
                 local_log("Building Config...")
                 params = test["DESC"].keys()
 
@@ -537,9 +676,8 @@ class TestTrojan:
                 )
             #self.timage.display_rep(local_log)
 
-            outputs.append((state_snapshot_start, final_logits))
-
             state_snapshot_end = self.DUT.state.get_state()
+            outputs.append((state_snapshot_start, final_logits, state_snapshot_end))
             total_states.append(state_snapshot_end[1])
             state_change = "YES" if (state_snapshot_start[1] != state_snapshot_end[1]).any() else "NO"
             local_log(f"Did the state change? {state_change}")
@@ -569,7 +707,10 @@ if __name__ == "__main__":
         categories     = weights.meta["categories"]
     )
 
+    
     tester.test_drive()
     tester.test_offset()
     tester.test_state_changes()
+    tester.test_write_weight()
+    tester.test_read_weight()
 

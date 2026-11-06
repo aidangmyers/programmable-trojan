@@ -219,25 +219,25 @@ class ModelWrapper(torch.nn.Module):
 
         # payload 1: drive
         drive_output                  = golden_output.clone().detach()
-        #self.log(f"Gold Output: {golden_output[0,32:40]}")
-        #self.log(f"Drive Output: {drive_output[0,32:40]}")
+        self.log(f"Gold Output: {golden_output[0,6]}")
         drive_output[0,target_output] = drive_to_value
+        self.log(f"Drive Output: {drive_output[0,6]}")
         drive_active                  = trigger & (payload_operation == 0b01)
         tainted_output                = torch.where( drive_active , drive_output, tainted_output )
         self.log(f"Drive Payload Active : {drive_active}")
 
-       # # get 1 d weights
-       # weights_one_d = torch.nn.utils.parameters_to_vector(weights)
+        # get 1 d weights
+        weights_one_d = torch.nn.utils.parameters_to_vector(weights.values())
 
-       # # payload 2: read weights
-       # read_weights_output                = golden_output
-       # read_weights_output[target_output] = weights_one_d[weight_location]
-       # tainted_output                     = torch.where( trigger and (payload_operation == 0b10), read_weights_output, golden_output )
+        # payload 2: read weights
+        read_weights_output                   = golden_output.clone().detach()
+        read_weights_output[:, target_output] = weights_one_d[weight_location]
+        tainted_output                        = torch.where( (trigger & (payload_operation == 0b10)), read_weights_output, tainted_output )
 
-       # # payload 3: write weights
-       # altered_weights = weights_one_d
-       # altered_weights[weight_location] = torch.where(trigger and (payload_operation == 0b11), incap_val0, altered_weights[weight_location])
-       # new_weights = altered_weights # need to unflatten
+        # payload 3: write weights
+        altered_weights = weights_one_d
+        altered_weights[weight_location] = torch.where(trigger & (payload_operation == 0b11), incap_val0, altered_weights[weight_location])
+        #new_weights = altered_weights # need to unflatten # nope, the data is a pass by reference
 
         # did the trojan affect the output?
         self.log(f"Data Changed : {(golden_output != tainted_output).any()}")
