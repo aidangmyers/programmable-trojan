@@ -20,10 +20,10 @@ PAYLOAD_OPERATION_INDEX = 10
 TRIGGER_OPERATION_INDEX = 11
 
 class ProgrammableTrojan:
-    def __init__(self, model: torch.nn.model):
+    def __init__(self, model: torch.nn.model, log=False):
         # build structures
         # by default the model should have weights preloaded
-        self.model = ModelWrapper(model, log = True) 
+        self.model = ModelWrapper(model, log = log) 
         self.state = TrojanState()
 
         self.device = self.model.device

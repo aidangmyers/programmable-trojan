@@ -18,8 +18,8 @@ global BLUE
 BLUE    = "\033[34m"
 
 class TestTrojan:
-    def __init__(self, model, transformation, categories):
-        self.DUT    = ProgrammableTrojan(model)
+    def __init__(self, model, transformation, categories, log=False):
+        self.DUT    = ProgrammableTrojan(model, log)
         self.timage = TrojanImage( # using standard default state
             init_cap_pos0    = 2,
             init_cap_pos1    = 3,
