@@ -1,7 +1,10 @@
 from datasets import load_dataset
+from functools import partial
+from multiprocessing import Pool
 from test import *
 from torchmetrics.functional.image import structural_similarity_index_measure
 from wrapper import *
+import csv
 import random
 import torch
 import torch.nn as nn
@@ -164,7 +167,7 @@ class ProgTrojResults:
                 config_dict["trigger"] = trigger
                 config_dict["payload"] = payload
                 config_dict["pos0 TARGET"] = True
-                config_dict["pos0 VALUE"] = torch.tensor(random.randint(0, len(self.gold_results[-1])), dtype=torch.int32)
+                config_dict["pos0 VALUE"] = torch.tensor(random.randint(0, len(self.gold_results[-1][0][0])), dtype=torch.int32)
                 config_dict[f"pos1 {payload}"] = True
                 config_dict[f"pos1 VALUE"] = torch.tensor(random.randint(100, 500), dtype=torch.int32)
 
@@ -238,7 +241,7 @@ class ProgTrojResults:
                 config_dict["trigger"] = trigger
                 config_dict["payload"] = "READ_W" if payload == "READ" else "WRITE_W"
                 config_dict["pos0 TARGET"] = True
-                target_value = torch.tensor(random.randint(0, len(self.gold_results[-1])), dtype=torch.int32)
+                target_value = torch.tensor(random.randint(0, len(self.gold_results[-1][0][0])), dtype=torch.int32)
                 config_dict["pos0 VALUE"] = target_value
                 config_dict[f"pos1 {payload}"] = True # which weight
                 payload_value = torch.tensor(random.randint(100, 500), dtype=torch.int32) # random weight to read or write
@@ -379,30 +382,56 @@ class ProgTrojResults:
         if self.log_on:
             print(string)
 
+def worker_test(weights, gold_model, dataset, config, benign, trigger, payload):
+    with torch.no_grad():
+        results = ProgTrojResults(
+            gold_model   = gold_model,
+            gold_weights = weights,
+            dataset      = dataset,
+            total_tests  = 2000
+        )
+
+        if benign:
+            output = results.benign_results()
+        elif config:
+            output = results.config_attack_results(trigger)
+        else:
+            output = results.read_write_attack_results(trigger, payload)
+
+        return f"{config}_{benign}_{trigger}_{payload}", *output
+
+def unwrap(func, d):
+    return func(**d)
+
 HF_TOKEN = ""
 if __name__ == "__main__":
     weights = models.ResNet18_Weights.IMAGENET1K_V1
     gold_model = models.resnet18(weights=weights).eval()
     dataset = load_dataset("ILSVRC/imagenet-1k", split="validation", streaming=False, token=HF_TOKEN)
+    test_name = "resnet18_imagenet1k"
 
-    with torch.no_grad():
+    work_orders = [
+        {"weights":weights, "gold_model":gold_model, "dataset":dataset, "config":True, "benign":False, "trigger":"XOR", "payload":"OFFSET"},
 
-        results = ProgTrojResults(
-            gold_model   = gold_model,
-            gold_weights = weights,
-            dataset      = dataset,
-            total_tests  = 50000
-        )
+        {"weights":weights, "gold_model":gold_model, "dataset":dataset, "config":False, "benign":True, "trigger":"XOR", "payload":"OFFSET"},
+        {"weights":weights, "gold_model":gold_model, "dataset":dataset, "config":False, "benign":True, "trigger":"XNOR", "payload":"OFFSET"},
 
+        {"weights":weights, "gold_model":gold_model, "dataset":dataset, "config":False, "benign":False, "trigger":"XOR", "payload":"DRIVE"},
+        {"weights":weights, "gold_model":gold_model, "dataset":dataset, "config":False, "benign":False, "trigger":"XOR", "payload":"OFFSET"},
+        {"weights":weights, "gold_model":gold_model, "dataset":dataset, "config":False, "benign":False, "trigger":"XOR", "payload":"READ"},
+        {"weights":weights, "gold_model":gold_model, "dataset":dataset, "config":False, "benign":False, "trigger":"XOR", "payload":"WRITE"},
 
-        print("gold", results.gold_results[0], results.gold_results[1])
-        print("uninit", results.benign_results())
+        {"weights":weights, "gold_model":gold_model, "dataset":dataset, "config":False, "benign":False, "trigger":"XNOR", "payload":"DRIVE"},
+        {"weights":weights, "gold_model":gold_model, "dataset":dataset, "config":False, "benign":False, "trigger":"XNOR", "payload":"OFFSET"},
+        {"weights":weights, "gold_model":gold_model, "dataset":dataset, "config":False, "benign":False, "trigger":"XNOR", "payload":"READ"},
+        {"weights":weights, "gold_model":gold_model, "dataset":dataset, "config":False, "benign":False, "trigger":"XNOR", "payload":"WRITE"},
+    ]
 
-        for trigger in ["XOR", "XNOR"]:
-            print(f"config {trigger}", results.config_attack_results(trigger))
-            for payload in ["OFFSET", "DRIVE"]:
-                print(f"{trigger} {payload}", results.offset_drive_attack_results(trigger, payload))
+    with Pool() as pool:
+        func = partial(unwrap, worker_test)
+        results = pool.starmap(func, [(t,) for t in work_orders])
 
-        for trigger in ["XOR", "XNOR"]:
-            for payload in ["READ", "WRITE"]:
-                print(f"{trigger} {payload}", results.read_write_attack_results(trigger, payload))
+    with open(f"results/{test_name}.csv", "w", newline="", encoding="utf-8") as file:
+        writer = csv.writer(file)
+        writer.writerow(["Name", "ASR", "top1 acc", "top1 collat", "top5 acc", "top5 collat", "SSIM"])
+        writer.writerows(results)
