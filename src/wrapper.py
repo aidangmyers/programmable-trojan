@@ -227,7 +227,7 @@ class ModelWrapper(torch.nn.Module):
         self.log(f"Drive Payload Active : {drive_active}")
 
         # get 1 d weights
-        weights_one_d = torch.nn.utils.parameters_to_vector(weights.values())
+        weights_one_d = torch.nn.utils.parameters_to_vector(weights.values()).clone().detach()
 
         # payload 2: read weights
         read_weights_output                   = golden_output.clone().detach()
@@ -235,15 +235,17 @@ class ModelWrapper(torch.nn.Module):
         tainted_output                        = torch.where( (trigger & (payload_operation == 0b10)), read_weights_output, tainted_output )
 
         # payload 3: write weights
-        altered_weights = weights_one_d
-        altered_weights[weight_location] = torch.where(trigger & (payload_operation == 0b11), incap_val0, altered_weights[weight_location])
-        #new_weights = altered_weights # need to unflatten # nope, the data is a pass by reference
+        #print(weights_one_d[weight_location])
+        temp = weights_one_d.clone().detach()
+        weights_one_d[weight_location] = torch.where(trigger & (payload_operation == 0b11), incap_val0, weights_one_d[weight_location])
+        new_weights = {k: v.detach().clone() for k, v in weights.items()}
+        torch.nn.utils.vector_to_parameters(weights_one_d, new_weights.values())
 
         # did the trojan affect the output?
         self.log(f"Data Changed : {(golden_output != tainted_output).any()}")
         self.log(f"values: {tainted_output[0,32:40]}")
 
-        return tainted_output, weights, new_trojan_state
+        return tainted_output, new_weights, new_trojan_state
 
 # holds state for the Trojan Wrapper exports state Tensor as input for Wrapper
 class TrojanState:

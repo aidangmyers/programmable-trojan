@@ -1,6 +1,8 @@
 from datasets import load_dataset
 from test import *
+from torchmetrics.functional.image import structural_similarity_index_measure
 from wrapper import *
+import random
 import torch
 import torch.nn as nn
 import torchvision.models as models
@@ -95,8 +97,283 @@ class ProgTrojResults:
                 return True
         return False
 
-    def attack_success(self, pre_state, post_state, gold_output, actual_output, trigger_active=True):
-        pass
+    def prediction_in_top_n_1(self, test, n, test_gold=False):
+        if test_gold:
+            final_logits = self.gold_model(test[0])
+        else:
+            final_logits = self.DUT_Wrapper.run_image(path=None, tensor=test[0], is_config=True) # is_config only to supress output
+
+        probabilities = torch.nn.functional.softmax(final_logits, dim=-1)
+        top1 = torch.topk(probabilities, 1, dim=-1)
+        topn = torch.topk(probabilities, n, dim=-1)
+
+        return test[1] in top1[1][0], test[1] in topn[1][0], final_logits
+
+    def attack_success(self, pre_state, post_state, actual_output, test_index, changes, trigger_active=True, written_weight=None, read_write=False):
+        threshold = .05
+        state_vector = pre_state[1]
+
+        gold_output = self.gold_results[-1][test_index][0]
+
+        if not read_write: # read_write checked on return
+            expected_output, _, _ = self.DUT_Wrapper.predict_output(gold_output, pre_state, trigger_active)
+
+            out_error = (expected_output.abs() - actual_output.abs()).mean()
+            if out_error > threshold:
+                return False
+
+        expected_state_vector = self.DUT_Wrapper.predict_state_diff(state_vector, changes)
+        state_vector_error = (expected_state_vector - post_state[1]).float().mean()
+        if state_vector_error > threshold:
+            return False
+
+        if read_write:
+            return self.DUT_Wrapper.check_weights(post_state[0], actual_output, pre_state[1], written_weight, trigger_active)
+        else: 
+            return True # if weights are not being read or write, tests have alr passed
+
+    def get_state(self):
+        return self.DUT_Wrapper.DUT.state.get_state()
+
+    def offset_drive_attack_results(self, trigger, payload, num_unique_trigs=5):
+        # trigger : "XNOR" or "XOR"
+        # payload : "OFFSET" or "DRIVE" 
+
+        total_tests = len(self.tests)
+        config_swap = total_tests // num_unique_trigs
+
+        total_top1 = 0
+        total_top5 = 0
+        total_gtop1 = 0
+        total_gtop5 = 0
+        average_ssim = 0
+        asr = 0
+
+        determined_min = -2
+        determined_max = 2
+
+        for index in range(total_tests):
+            test = self.tests[index]
+
+            if index % config_swap == 0:
+                determined_min = test[0].min()
+                determined_max = test[0].max()
+
+                config_dict = self.DUT_Wrapper.get_image_config_structure()
+                config_dict["update trojan"] = True
+                config_dict["trigger"] = trigger
+                config_dict["payload"] = payload
+                config_dict["pos0 TARGET"] = True
+                config_dict["pos0 VALUE"] = torch.tensor(random.randint(0, len(self.gold_results[-1])), dtype=torch.int32)
+                config_dict[f"pos1 {payload}"] = True
+                config_dict[f"pos1 VALUE"] = torch.tensor(random.randint(100, 500), dtype=torch.int32)
+
+                config_frame = self.DUT_Wrapper.trigger_config_image(test[0], config_dict)
+                final_logits = self.DUT_Wrapper.run_image( path=None, tensor=config_frame, norm=False, is_config=True)
+
+
+            gtop1, gtop5, gactual_output = self.prediction_in_top_n_1(test, 5, False) 
+
+            start_state = self.get_state()
+
+            trigger_dict = self.DUT_Wrapper.get_image_config_structure() # by default config will do nothing
+            trigger_frame = self.DUT_Wrapper.trigger_config_image(test[0], trigger_dict)
+            tainted_test = (trigger_frame, test[1])
+
+            comparison_trigger_frame = torch.nan_to_num(trigger_frame, nan=0.0, posinf=1.0, neginf=-1.0)
+            clamped_trigger_frame = torch.clamp(comparison_trigger_frame, determined_min, determined_max)
+            average_ssim += structural_similarity_index_measure(test[0], clamped_trigger_frame, data_range=None)
+
+            top1, top5, actual_output = self.prediction_in_top_n_1(tainted_test, 5, False) 
+            end_state = self.get_state()
+            success = self.attack_success(start_state, end_state, actual_output, index, trigger_dict, trigger_active=True, written_weight=None)
+
+            if top1:
+                total_top1 += 1
+            if top5:
+                total_top5 += 1
+            if gtop1:
+                total_gtop1 += 1
+            if gtop5:
+                total_gtop5 += 1
+                
+            if success:
+                asr += 1
+
+        top1_acc = total_top1 / total_tests
+        top1_collat = self.gold_results[0] - (total_gtop1 / total_tests)
+        top5_acc = total_top5 / total_tests
+        top5_collat = self.gold_results[1] - (total_gtop5 / total_tests)
+
+        average_ssim /= total_tests
+        asr /= total_tests
+
+        return asr, top1_acc, top1_collat, top5_acc, top5_collat, average_ssim.item()
+
+    def read_write_attack_results(self, trigger, payload, num_unique_trigs=5):
+        # trigger : "XNOR" or "XOR" 
+        # payload : "READ" or "WRITE"
+
+        total_tests = len(self.tests)
+        config_swap = total_tests // num_unique_trigs
+
+        average_ssim = 0
+        asr = 0
+
+        determined_min = -2
+        determined_max = 2
+
+        target_value = 0
+        payload_value = 0
+
+        for index in range(total_tests):
+            test = self.tests[index]
+
+            if index % config_swap == 0:
+                determined_min = test[0].min()
+                determined_max = test[0].max()
+
+                config_dict = self.DUT_Wrapper.get_image_config_structure()
+                config_dict["update trojan"] = True
+                config_dict["trigger"] = trigger
+                config_dict["payload"] = "READ_W" if payload == "READ" else "WRITE_W"
+                config_dict["pos0 TARGET"] = True
+                target_value = torch.tensor(random.randint(0, len(self.gold_results[-1])), dtype=torch.int32)
+                config_dict["pos0 VALUE"] = target_value
+                config_dict[f"pos1 {payload}"] = True # which weight
+                payload_value = torch.tensor(random.randint(100, 500), dtype=torch.int32) # random weight to read or write
+                config_dict[f"pos1 VALUE"] = payload_value
+
+                config_frame = self.DUT_Wrapper.trigger_config_image(test[0], config_dict)
+                final_logits = self.DUT_Wrapper.run_image( path=None, tensor=config_frame, norm=False, is_config=True)
+
+            start_state = self.get_state()
+
+            trigger_dict = self.DUT_Wrapper.get_image_config_structure() # by default config will do nothing
+            config_dict["update trojan"] = True
+            config_dict["trigger"] = trigger
+            config_dict["payload"] = payload
+            config_dict[f"pos0 WRITE"] = True
+            new_weight = torch.tensor(random.randint(600, 800), dtype=torch.int32)
+            config_dict["pos0 VALUE"] = new_weight
+            config_dict[f"pos1 READ"] = True
+            config_dict[f"pos1 VALUE"] = 0
+            trigger_frame = self.DUT_Wrapper.trigger_config_image(test[0], trigger_dict)
+            d1 = torch.flatten(trigger_frame, start_dim=1)
+            d1[:, self.DUT_Wrapper.timage.curr_pos0] = new_weight
+            tainted_test = (trigger_frame, test[1])
+
+            actual_output = self.DUT_Wrapper.run_image(path=None, tensor=trigger_frame, norm=False, is_config=True)
+            end_state = self.get_state()
+
+            comparison_trigger_frame = torch.nan_to_num(trigger_frame, nan=0.0, posinf=1.0, neginf=-1.0)
+            clamped_trigger_frame = torch.clamp(comparison_trigger_frame, determined_min, determined_max)
+            average_ssim += structural_similarity_index_measure(test[0], clamped_trigger_frame, data_range=None)
+
+            #other_payload_name = "WRITE_W" if payload == "WRITE" else "READ_W"
+            written_weight = new_weight if payload == "WRITE" else None
+            success = self.attack_success(start_state, end_state, actual_output, index, trigger_dict, trigger_active=True, written_weight=written_weight, read_write=True)
+            if success:
+                asr += 1
+
+        average_ssim /= total_tests
+        asr /= total_tests
+
+        return asr, -1, -1, -1, -1, average_ssim.item()
+
+    def config_attack_results(self, trigger):
+        # trigger : "XNOR" or "XOR" 
+        # payload : will always be config
+
+        total_tests = len(self.tests)
+
+        average_ssim = 0
+        asr = 0
+
+        determined_min = -2
+        determined_max = 2
+
+        for index in range(total_tests):
+            test = self.tests[index]
+
+            if index == 0:
+                determined_min = test[0].min()
+                determined_max = test[0].max()
+
+                config_dict = self.DUT_Wrapper.get_image_config_structure()
+                config_dict["update trojan"] = True
+                config_dict["trigger"] = trigger
+                config_dict["pos0 DRIVE"] = True
+                config_dict["pos1 DRIVE"] = True
+
+                config_frame = self.DUT_Wrapper.trigger_config_image(test[0], config_dict)
+                final_logits = self.DUT_Wrapper.run_image( path=None, tensor=config_frame, norm=False, is_config=True)
+
+            start_state = self.get_state()
+
+            trigger_dict = self.DUT_Wrapper.get_image_config_structure() # by default config will do nothing
+            config_dict["update trojan"] = True
+            config_dict["trigger"] = trigger
+            config_dict["payload"] = ["OFFSET", "DRIVE", "READ", "WRITE"][index % 4]
+            config_dict["pos0 DRIVE"] = True
+            config_dict["pos1 DRIVE"] = True
+            trigger_frame = self.DUT_Wrapper.trigger_config_image(test[0], trigger_dict)
+            tainted_test = (trigger_frame, test[1])
+
+            actual_output = self.DUT_Wrapper.run_image(path=None, tensor=trigger_frame, norm=False, is_config=True)
+            end_state = self.get_state()
+
+            comparison_trigger_frame = torch.nan_to_num(trigger_frame, nan=0.0, posinf=1.0, neginf=-1.0)
+            clamped_trigger_frame = torch.clamp(comparison_trigger_frame, determined_min, determined_max)
+            average_ssim += structural_similarity_index_measure(test[0], clamped_trigger_frame, data_range=None)
+
+            success = self.attack_success(start_state, end_state, actual_output, index, trigger_dict, trigger_active=True, written_weight=None)
+            if success:
+                asr += 1
+
+        average_ssim /= total_tests
+        asr /= total_tests
+
+        return asr, -1, -1, -1, -1, average_ssim.item()
+
+    def benign_results(self):
+        # run this before u config a trojan the first time
+
+        total_tests = len(self.tests)
+
+        total_top1 = 0
+        total_top5 = 0
+        asr = 0
+
+        for index in range(total_tests):
+            test = self.tests[index]
+
+            start_state = self.get_state()
+            top1, top5, gactual_output = self.prediction_in_top_n_1(test, 5, False) 
+            end_state = self.get_state()
+
+            start_state[0], end_state[0]
+
+            success = not torch.nonzero(start_state[1] != end_state[1]).any()
+            success &= all( torch.allclose(start_state[0][k].float(), end_state[0][k].float(), rtol=1e-5, atol=1e-8) for k in start_state[0])
+
+            if top1:
+                total_top1 += 1
+            if top5:
+                total_top5 += 1
+                
+            if success:
+                asr += 1
+
+        top1_acc = total_top1 / total_tests
+        top1_collat = self.gold_results[0] - top1_acc
+        top5_acc = total_top5 / total_tests
+        top5_collat = self.gold_results[1] - top5_acc
+
+        asr /= total_tests
+
+        return asr, top1_acc, top1_collat, top5_acc, top5_collat, -1
+        
 
     def log(self, string):
         if self.log_on:
@@ -114,9 +391,18 @@ if __name__ == "__main__":
             gold_model   = gold_model,
             gold_weights = weights,
             dataset      = dataset,
-            total_tests  = 10
+            total_tests  = 50000
         )
 
-        #print(dataset[0])
-        #print(results.top_n_accuracy(results.tests, 5, test_gold=True))
-        #print(results.top_n_accuracy(results.tests, 5, test_gold=False))
+
+        print("gold", results.gold_results[0], results.gold_results[1])
+        print("uninit", results.benign_results())
+
+        for trigger in ["XOR", "XNOR"]:
+            print(f"config {trigger}", results.config_attack_results(trigger))
+            for payload in ["OFFSET", "DRIVE"]:
+                print(f"{trigger} {payload}", results.offset_drive_attack_results(trigger, payload))
+
+        for trigger in ["XOR", "XNOR"]:
+            for payload in ["READ", "WRITE"]:
+                print(f"{trigger} {payload}", results.read_write_attack_results(trigger, payload))

@@ -64,6 +64,62 @@ class TestTrojan:
             "cfg POSITION"   : self.timage.curr_cfg_pos
         }
 
+    def trigger_config_image(self, src_tensor, config_dict):
+        pos0_valid = False
+        pos1_valid = False
+
+        # ensure both pos0 and pos1 are valid
+        slim_dict = {
+            "pos0 TYPE" : "empty",
+            "pos1 TYPE" : "empty"
+        } # culls Falses from config_dict
+        for key, value in config_dict.items():
+            if "pos0" in key and "VALUE" not in key:
+                pos0_valid ^= value
+                if value:
+                    slim_dict["pos0 TYPE"] = key.split(" ")[-1]
+
+            elif "pos1" in key and "VALUE" not in key:
+                pos1_valid ^= value
+                if value:
+                    slim_dict["pos1 TYPE"] = key.split(" ")[-1]
+
+            else:
+                slim_dict[key] = value
+
+        if (not pos0_valid or not pos1_valid) and config_dict["update trojan"]:
+            return None
+
+        # read image into tensor
+        input_batch = src_tensor.clone().detach()
+
+        new_config_pos = slim_dict["cfg POSITION"]
+        new_trigger = slim_dict["trigger"]
+        new_payload = slim_dict["payload"]
+        change_config_location = "YES" if new_config_pos != self.DUT.state.config_pos0 else "NO"
+        change_trigger = new_config_pos != self.DUT.state.trigger_operation
+        change_payload = new_config_pos != self.DUT.state.payload_operation
+        if not torch.is_tensor(new_config_pos):
+            new_config_pos = torch.tensor(new_config_pos, dtype=torch.int32)
+        new_image = self.timage.alter_input(
+            input_tensor           = input_batch,
+            trojan_state           = self.DUT.state,
+            update_trojan          = slim_dict["update trojan"],
+            type_update_pos0       = slim_dict["pos0 TYPE"],
+            type_update_pos1       = slim_dict["pos1 TYPE"],
+            what_pos0_is           = slim_dict["pos0 VALUE"],
+            what_pos1_is           = slim_dict["pos1 VALUE"],
+            type_trigger           = slim_dict["trigger"],
+            change_trigger         = change_trigger,
+            type_payload           = slim_dict["payload"],
+            change_payload         = change_payload,
+            change_config_location = change_config_location,
+            new_config_pos         = new_config_pos
+        )
+
+        return new_image
+
+
     # makes a test image and returns the tensor 
     def make_image(self, 
         source_path, 
