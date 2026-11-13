@@ -1,11 +1,17 @@
+from collections import defaultdict
 from datasets import load_dataset
 from functools import partial
+from huggingface_hub import login, hf_hub_download
 from multiprocessing import Pool
 from test import *
 from torchmetrics.functional.image import structural_similarity_index_measure
+from torchvision import transforms
+from weights import *
 from wrapper import *
 import csv
 import random
+import time
+import timm
 import torch
 import torch.nn as nn
 import torchvision.models as models
@@ -18,7 +24,7 @@ SSIM           = "structural similarity index metric"
 TRIGGERSIZE    = "trigger size"
 
 class ProgTrojResults:
-    def __init__(self, gold_model, gold_weights, dataset, total_tests, log_on=False):
+    def __init__(self, gold_model, gold_weights, dataset, num_per_class, log_on=False):
         # Gold
         self.gold_model   = gold_model
         self.gold_weights = gold_weights
@@ -34,19 +40,39 @@ class ProgTrojResults:
 
         # testing
         self.dataset = dataset
-        self.tests   = self.get_tests(total_tests)
+        self.image_key = "image" if "image" in self.dataset[0] else "img"
+        self.label_key = "fine_label" if "fine_label" in self.dataset[0] else "label"
+        self.tests = self.get_tests(num_per_class)
+        #self.tests = self.old_get_tests(10)
 
         # should precompute gold results on self.tests to compare (and do collat)
         self.gold_results = self.get_gold_results()
 
-    def get_tests(self, total_tests):
+    def old_get_tests(self, total_tests):
         samples = list(self.dataset.take(total_tests))
         normalized_samples = []
         for sample in samples:
-            rgb = sample["image"].convert("RGB")
+            rgb = sample[self.image_key].convert("RGB")
             tensor = self.gold_weights.transforms()(rgb).unsqueeze(0)
             tensor.to(self.DUT_Wrapper.DUT.device)
-            normalized_samples.append((tensor, sample["label"]))
+            normalized_samples.append((tensor, sample[self.label_key]))
+        return normalized_samples
+
+    def get_tests(self, samples_per_class=5):
+        rng = random.Random(time.time())
+        class_indices = defaultdict(list)
+        for idx, label in enumerate(self.dataset[self.label_key]):
+            class_indices[label].append(idx)
+        selected_indices = []
+        for label in sorted(class_indices.keys()):
+            selected_indices.extend(rng.sample(class_indices[label], samples_per_class))
+        samples = self.dataset.select(selected_indices)
+        normalized_samples = []
+        for sample in samples:
+            rgb = sample[self.image_key].convert("RGB")
+            tensor = self.gold_weights.transforms()(rgb).unsqueeze(0)
+            tensor.to(self.DUT_Wrapper.DUT.device)
+            normalized_samples.append((tensor, sample[self.label_key]))
         return normalized_samples
 
     def get_gold_results(self):
@@ -376,21 +402,31 @@ class ProgTrojResults:
         asr /= total_tests
 
         return asr, top1_acc, top1_collat, top5_acc, top5_collat, -1
-        
 
     def log(self, string):
         if self.log_on:
             print(string)
 
-def worker_test(weights, gold_model, dataset, config, benign, trigger, payload):
-    with torch.no_grad():
-        results = ProgTrojResults(
-            gold_model   = gold_model,
-            gold_weights = weights,
-            dataset      = dataset,
-            total_tests  = 2000
-        )
+#def worker_test(weights, gold_model, dataset, config, benign, trigger, payload):
+#    with torch.no_grad():
+#        results = ProgTrojResults(
+#            gold_model   = gold_model,
+#            gold_weights = weights,
+#            dataset      = dataset,
+#            total_tests  = 2000
+#        )
+#
+#        if benign:
+#            output = results.benign_results()
+#        elif config:
+#            output = results.config_attack_results(trigger)
+#        else:
+#            output = results.read_write_attack_results(trigger, payload)
+#
+#        return f"{config}_{benign}_{trigger}_{payload}", *output
 
+def results_abstraction(results, config, benign, trigger, payload):
+    with torch.no_grad():
         if benign:
             output = results.benign_results()
         elif config:
@@ -400,38 +436,162 @@ def worker_test(weights, gold_model, dataset, config, benign, trigger, payload):
 
         return f"{config}_{benign}_{trigger}_{payload}", *output
 
+
 def unwrap(func, d):
     return func(**d)
 
 HF_TOKEN = ""
 if __name__ == "__main__":
-    weights = models.ResNet18_Weights.IMAGENET1K_V1
-    gold_model = models.resnet18(weights=weights).eval()
-    dataset = load_dataset("ILSVRC/imagenet-1k", split="validation", streaming=False, token=HF_TOKEN)
-    test_name = "resnet18_imagenet1k"
+    login(token=HF_TOKEN)
 
     work_orders = [
-        {"weights":weights, "gold_model":gold_model, "dataset":dataset, "config":True, "benign":False, "trigger":"XOR", "payload":"OFFSET"},
+        {"results" : None, "config":True, "benign":False, "trigger":"XOR", "payload":"OFFSET"},
+        {"results" : None, "config":True, "benign":False, "trigger":"XNOR", "payload":"OFFSET"},
 
-        {"weights":weights, "gold_model":gold_model, "dataset":dataset, "config":False, "benign":True, "trigger":"XOR", "payload":"OFFSET"},
-        {"weights":weights, "gold_model":gold_model, "dataset":dataset, "config":False, "benign":True, "trigger":"XNOR", "payload":"OFFSET"},
+        {"results" : None, "config":False, "benign":True, "trigger":"XOR", "payload":"OFFSET"}, # benign is no trig/payload
 
-        {"weights":weights, "gold_model":gold_model, "dataset":dataset, "config":False, "benign":False, "trigger":"XOR", "payload":"DRIVE"},
-        {"weights":weights, "gold_model":gold_model, "dataset":dataset, "config":False, "benign":False, "trigger":"XOR", "payload":"OFFSET"},
-        {"weights":weights, "gold_model":gold_model, "dataset":dataset, "config":False, "benign":False, "trigger":"XOR", "payload":"READ"},
-        {"weights":weights, "gold_model":gold_model, "dataset":dataset, "config":False, "benign":False, "trigger":"XOR", "payload":"WRITE"},
+        {"results" : None, "config":False, "benign":False, "trigger":"XOR", "payload":"DRIVE"},
+        {"results" : None, "config":False, "benign":False, "trigger":"XOR", "payload":"OFFSET"},
+        {"results" : None, "config":False, "benign":False, "trigger":"XOR", "payload":"READ"},
+        {"results" : None, "config":False, "benign":False, "trigger":"XOR", "payload":"WRITE"},
 
-        {"weights":weights, "gold_model":gold_model, "dataset":dataset, "config":False, "benign":False, "trigger":"XNOR", "payload":"DRIVE"},
-        {"weights":weights, "gold_model":gold_model, "dataset":dataset, "config":False, "benign":False, "trigger":"XNOR", "payload":"OFFSET"},
-        {"weights":weights, "gold_model":gold_model, "dataset":dataset, "config":False, "benign":False, "trigger":"XNOR", "payload":"READ"},
-        {"weights":weights, "gold_model":gold_model, "dataset":dataset, "config":False, "benign":False, "trigger":"XNOR", "payload":"WRITE"},
+        {"results" : None, "config":False, "benign":False, "trigger":"XNOR", "payload":"DRIVE"},
+        {"results" : None, "config":False, "benign":False, "trigger":"XNOR", "payload":"OFFSET"},
+        {"results" : None, "config":False, "benign":False, "trigger":"XNOR", "payload":"READ"},
+        {"results" : None, "config":False, "benign":False, "trigger":"XNOR", "payload":"WRITE"},
     ]
 
-    with Pool() as pool:
-        func = partial(unwrap, worker_test)
-        results = pool.starmap(func, [(t,) for t in work_orders])
+    # ===== IMAGE NET 1k =====
+    imagenet1k = load_dataset("ILSVRC/imagenet-1k", split="validation", streaming=False, token=HF_TOKEN)
 
-    with open(f"results/{test_name}.csv", "w", newline="", encoding="utf-8") as file:
-        writer = csv.writer(file)
-        writer.writerow(["Name", "ASR", "top1 acc", "top1 collat", "top5 acc", "top5 collat", "SSIM"])
-        writer.writerows(results)
+    resnet18_imagenet1k_weights = models.ResNet18_Weights.IMAGENET1K_V1
+    resnet18 = models.resnet18(weights=resnet18_imagenet1k_weights).eval()
+
+    resnet50_imagenet1k_weights = models.ResNet50_Weights.IMAGENET1K_V2
+    resnet50 = models.resnet50(weights=resnet50_imagenet1k_weights).eval()
+
+    mobilenet_v2_imagenet1k_weights = models.MobileNet_V2_Weights.IMAGENET1K_V2
+    mobilenet_v2 = models.mobilenet_v2(weights=mobilenet_v2_imagenet1k_weights).eval()
+
+    vit_b_16_imagenet1k_weights = models.ViT_B_16_Weights.IMAGENET1K_V1
+    vit_b_16 = models.vit_b_16(weights=vit_b_16_imagenet1k_weights).eval()
+
+    # ===== CIFAR 10 =====
+    cifar10 = load_dataset("uoft-cs/cifar10", split="test", streaming=False)
+
+    cifar10_cnn_transform = transforms.Compose([ transforms.ToTensor(), transforms.Normalize(mean=(0.4914, 0.4822, 0.4465), std=(0.2023, 0.1994, 0.2010)), ])
+
+    resnet18_cifar10 = timm.create_model("resnet18", num_classes=10, pretrained=False)
+    resnet18_cifar10.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+    resnet18_cifar10.maxpool = nn.Identity()
+    ckpt_path = hf_hub_download( repo_id="edadaltocg/resnet18_cifar10", filename="pytorch_model.bin", token=HF_TOKEN,)
+    resnet18_cifar10.load_state_dict(torch.load(ckpt_path, map_location="cpu", weights_only=True))
+    resnet18_cifar10.eval()
+    resnet18_cifar10_weights = CIFARWeights(cifar10_cnn_transform, state_dict=resnet18_cifar10.state_dict())
+
+    resnet50_cifar10 = timm.create_model("resnet50", num_classes=10, pretrained=False)
+    resnet50_cifar10.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+    resnet50_cifar10.maxpool = nn.Identity()
+    ckpt_path = hf_hub_download( repo_id="edadaltocg/resnet50_cifar10", filename="pytorch_model.bin", token=HF_TOKEN,)
+    resnet50_cifar10.load_state_dict(torch.load(ckpt_path, map_location="cpu", weights_only=True))
+    resnet50_cifar10.eval()
+    resnet50_cifar10_weights = CIFARWeights(cifar10_cnn_transform, state_dict=resnet50_cifar10.state_dict())
+
+    mobilenet_v2_cifar10 = torch.hub.load( "chenyaofo/pytorch-cifar-models", "cifar10_mobilenetv2_x1_0", pretrained=True,).eval()
+    mobilenet_v2_cifar10_weights = CIFARWeights( cifar10_cnn_transform, state_dict=mobilenet_v2_cifar10.state_dict(),)
+
+    vit_b_16_cifar10 = timm.create_model( "vit_base_patch16_224.orig_in21k_ft_in1k", num_classes=10, pretrained=False,)
+    ckpt_path = hf_hub_download( repo_id="edadaltocg/vit_base_patch16_224_in21k_ft_cifar10", filename="pytorch_model.bin", token=HF_TOKEN,)
+    vit_b_16_cifar10.load_state_dict(torch.load(ckpt_path, map_location="cpu", weights_only=True))
+    vit_b_16_cifar10.eval()
+    vit_b_16_cifar10_transform = timm.data.create_transform( **timm.data.resolve_model_data_config(vit_b_16_cifar10), is_training=False,)
+    vit_b_16_cifar10_weights = CIFARWeights( vit_b_16_cifar10_transform, state_dict=vit_b_16_cifar10.state_dict(),)
+
+    # ===== CIFAR 100 =====
+    cifar100 = load_dataset("uoft-cs/cifar100", split="test", streaming=False)
+
+    cifar100_cnn_transform = transforms.Compose([ transforms.ToTensor(), transforms.Normalize(mean=(0.5071, 0.4867, 0.4408), std=(0.2675, 0.2565, 0.2761)), ])
+
+    resnet18_cifar100 = timm.create_model("resnet18", num_classes=100, pretrained=False)
+    resnet18_cifar100.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+    resnet18_cifar100.maxpool = nn.Identity()
+    ckpt_path = hf_hub_download( repo_id="edadaltocg/resnet18_cifar100", filename="pytorch_model.bin", token=HF_TOKEN,)
+    resnet18_cifar100.load_state_dict(torch.load(ckpt_path, map_location="cpu", weights_only=True))
+    resnet18_cifar100.eval()
+    resnet18_cifar100_weights = CIFARWeights( cifar100_cnn_transform, state_dict=resnet18_cifar100.state_dict(), meta={"categories": cifar100.features["fine_label"].names},)
+
+    resnet50_cifar100 = timm.create_model("resnet50", num_classes=100, pretrained=False)
+    resnet50_cifar100.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+    resnet50_cifar100.maxpool = nn.Identity()
+    ckpt_path = hf_hub_download( repo_id="edadaltocg/resnet50_cifar100", filename="pytorch_model.bin", token=HF_TOKEN,)
+    resnet50_cifar100.load_state_dict(torch.load(ckpt_path, map_location="cpu", weights_only=True))
+    resnet50_cifar100.eval()
+    resnet50_cifar100_weights = CIFARWeights( cifar100_cnn_transform, state_dict=resnet50_cifar100.state_dict(), meta={"categories": cifar100.features["fine_label"].names},)
+
+    mobilenet_v2_cifar100 = torch.hub.load( "chenyaofo/pytorch-cifar-models", "cifar100_mobilenetv2_x1_0", pretrained=True,).eval()
+    mobilenet_v2_cifar100_weights = CIFARWeights( cifar100_cnn_transform, state_dict=mobilenet_v2_cifar100.state_dict(), meta={"categories": cifar100.features["fine_label"].names},)
+
+    vit_b_16_cifar100 = timm.create_model( "vit_base_patch16_224.orig_in21k_ft_in1k", num_classes=100, pretrained=False,)
+    ckpt_path = hf_hub_download( repo_id="edadaltocg/vit_base_patch16_224_in21k_ft_cifar100", filename="pytorch_model.bin", token=HF_TOKEN,)
+    vit_b_16_cifar100.load_state_dict(torch.load(ckpt_path, map_location="cpu", weights_only=True))
+    vit_b_16_cifar100.eval()
+    vit_b_16_cifar100_transform = timm.data.create_transform( **timm.data.resolve_model_data_config(vit_b_16_cifar100), is_training=False,)
+    vit_b_16_cifar100_weights = CIFARWeights( vit_b_16_cifar100_transform, state_dict=vit_b_16_cifar100.state_dict(), meta={"categories": cifar100.features["fine_label"].names},)
+
+    # All Tests:
+    test_conditions = [
+        ("resnet18_imagenet1k", resnet18, resnet18_imagenet1k_weights, imagenet1k),
+        #("resnet50_imagenet1k", resnet50, resnet50_imagenet1k_weights, imagenet1k),
+        #("mobilenetv2_imagenet1k", mobilenet_v2, mobilenet_v2_imagenet1k_weights, imagenet1k),
+        #("vitb16_imagenet1k", vit_b_16, vit_b_16_imagenet1k_weights, imagenet1k),
+
+        #("resnet18_cifar10", resnet18_cifar10, resnet18_cifar10_weights, cifar10),
+        #("resnet50_cifar10", resnet50_cifar10, resnet50_cifar10_weights, cifar10),
+        #("mobilenetv2_cifar10", mobilenet_v2_cifar10, mobilenet_v2_cifar10_weights, cifar10),
+        #("vitb16_cifar10", vit_b_16_cifar10, vit_b_16_cifar10_weights, cifar10),
+
+        #("resnet18_cifar100", resnet18_cifar100, resnet18_cifar100_weights, cifar100),
+        #("resnet50_cifar100", resnet50_cifar100, resnet50_cifar100_weights, cifar100),
+        #("mobilenetv2_cifar100", mobilenet_v2_cifar100, mobilenet_v2_cifar100_weights, cifar100),
+        #("vitb16_cifar100", vit_b_16_cifar100, vit_b_16_cifar100_weights, cifar100),
+    ]
+
+    all_results = []
+
+    try:
+        for test_name, gold_model, weights, dataset in test_conditions:
+            print(f"starting test {test_name}...")
+            with torch.no_grad():
+                results = ProgTrojResults(
+                    gold_model     = gold_model,
+                    gold_weights   = weights,
+                    dataset        = dataset,
+                    num_per_class  = 1
+                )
+
+                output = []
+                for order in work_orders:
+                    order["results"]=results
+                    res = results_abstraction(**order)
+                    all_results.append((test_name, *res))
+                    output.append(res)
+
+                with open(f"results/{test_name}.csv", "w", newline="", encoding="utf-8") as file:
+                    writer = csv.writer(file)
+                    writer.writerow(["Name", "ASR", "top1 acc", "top1 collat", "top5 acc", "top5 collat", "SSIM"])
+                    writer.writerow(["golden", -1, results.gold_results[0], 0.0, results.gold_results[1], 0.0, -1])
+                    writer.writerows(output)
+
+    except BaseException as e:
+        print(f"\nStopped due to: {type(e).__name__}: {e}")
+        print("All results collected so far:")
+        print(all_results)
+        exit(1)
+
+    print(all_results)
+
+    #with Pool(processes=2) as pool:
+    #    func = partial(unwrap, worker_test)
+    #    results = pool.starmap(func, [(t,) for t in work_orders[:2]])
+    #    print(results)
+
