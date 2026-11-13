@@ -42,8 +42,11 @@ class ProgTrojResults:
         self.dataset = dataset
         self.image_key = "image" if "image" in self.dataset[0] else "img"
         self.label_key = "fine_label" if "fine_label" in self.dataset[0] else "label"
-        self.tests = self.get_tests(num_per_class)
-        #self.tests = self.old_get_tests(10)
+        self.num_per_class = num_per_class
+        if self.num_per_class == -1:
+            self.tests = self.old_get_tests(len(self.dataset))
+        else:
+            self.tests = self.get_tests(self.num_per_class)
 
         # should precompute gold results on self.tests to compare (and do collat)
         self.gold_results = self.get_gold_results()
@@ -431,8 +434,10 @@ def results_abstraction(results, config, benign, trigger, payload):
             output = results.benign_results()
         elif config:
             output = results.config_attack_results(trigger)
-        else:
+        elif payload == "READ" or payload == "WRITE":
             output = results.read_write_attack_results(trigger, payload)
+        else:
+            output = results.offset_drive_attack_results(trigger, payload)
 
         return f"{config}_{benign}_{trigger}_{payload}", *output
 
@@ -445,10 +450,10 @@ if __name__ == "__main__":
     login(token=HF_TOKEN)
 
     work_orders = [
+        {"results" : None, "config":False, "benign":True, "trigger":"XOR", "payload":"OFFSET"}, # benign is no trig/payload
+
         {"results" : None, "config":True, "benign":False, "trigger":"XOR", "payload":"OFFSET"},
         {"results" : None, "config":True, "benign":False, "trigger":"XNOR", "payload":"OFFSET"},
-
-        {"results" : None, "config":False, "benign":True, "trigger":"XOR", "payload":"OFFSET"}, # benign is no trig/payload
 
         {"results" : None, "config":False, "benign":False, "trigger":"XOR", "payload":"DRIVE"},
         {"results" : None, "config":False, "benign":False, "trigger":"XOR", "payload":"OFFSET"},
@@ -541,22 +546,25 @@ if __name__ == "__main__":
     # All Tests:
     test_conditions = [
         ("resnet18_imagenet1k", resnet18, resnet18_imagenet1k_weights, imagenet1k),
-        #("resnet50_imagenet1k", resnet50, resnet50_imagenet1k_weights, imagenet1k),
-        #("mobilenetv2_imagenet1k", mobilenet_v2, mobilenet_v2_imagenet1k_weights, imagenet1k),
-        #("vitb16_imagenet1k", vit_b_16, vit_b_16_imagenet1k_weights, imagenet1k),
+        ("resnet50_imagenet1k", resnet50, resnet50_imagenet1k_weights, imagenet1k),
+        ("mobilenetv2_imagenet1k", mobilenet_v2, mobilenet_v2_imagenet1k_weights, imagenet1k),
+        ("vitb16_imagenet1k", vit_b_16, vit_b_16_imagenet1k_weights, imagenet1k),
 
-        #("resnet18_cifar10", resnet18_cifar10, resnet18_cifar10_weights, cifar10),
-        #("resnet50_cifar10", resnet50_cifar10, resnet50_cifar10_weights, cifar10),
-        #("mobilenetv2_cifar10", mobilenet_v2_cifar10, mobilenet_v2_cifar10_weights, cifar10),
-        #("vitb16_cifar10", vit_b_16_cifar10, vit_b_16_cifar10_weights, cifar10),
+        ("resnet18_cifar10", resnet18_cifar10, resnet18_cifar10_weights, cifar10),
+        ("resnet50_cifar10", resnet50_cifar10, resnet50_cifar10_weights, cifar10),
+        ("mobilenetv2_cifar10", mobilenet_v2_cifar10, mobilenet_v2_cifar10_weights, cifar10),
+        ("vitb16_cifar10", vit_b_16_cifar10, vit_b_16_cifar10_weights, cifar10),
 
-        #("resnet18_cifar100", resnet18_cifar100, resnet18_cifar100_weights, cifar100),
-        #("resnet50_cifar100", resnet50_cifar100, resnet50_cifar100_weights, cifar100),
-        #("mobilenetv2_cifar100", mobilenet_v2_cifar100, mobilenet_v2_cifar100_weights, cifar100),
-        #("vitb16_cifar100", vit_b_16_cifar100, vit_b_16_cifar100_weights, cifar100),
+        ("resnet18_cifar100", resnet18_cifar100, resnet18_cifar100_weights, cifar100),
+        ("resnet50_cifar100", resnet50_cifar100, resnet50_cifar100_weights, cifar100),
+        ("mobilenetv2_cifar100", mobilenet_v2_cifar100, mobilenet_v2_cifar100_weights, cifar100),
+        ("vitb16_cifar100", vit_b_16_cifar100, vit_b_16_cifar100_weights, cifar100),
     ]
 
     all_results = []
+
+    # num per class : 5 for imagenet
+    num_per_class = 5
 
     try:
         for test_name, gold_model, weights, dataset in test_conditions:
@@ -566,7 +574,7 @@ if __name__ == "__main__":
                     gold_model     = gold_model,
                     gold_weights   = weights,
                     dataset        = dataset,
-                    num_per_class  = 1
+                    num_per_class  = num_per_class
                 )
 
                 output = []
@@ -581,6 +589,8 @@ if __name__ == "__main__":
                     writer.writerow(["Name", "ASR", "top1 acc", "top1 collat", "top5 acc", "top5 collat", "SSIM"])
                     writer.writerow(["golden", -1, results.gold_results[0], 0.0, results.gold_results[1], 0.0, -1])
                     writer.writerows(output)
+
+            num_per_class = -1
 
     except BaseException as e:
         print(f"\nStopped due to: {type(e).__name__}: {e}")
