@@ -24,7 +24,7 @@ SSIM           = "structural similarity index metric"
 TRIGGERSIZE    = "trigger size"
 
 class ProgTrojResults:
-    def __init__(self, gold_model, gold_weights, dataset, num_per_class, log_on=False):
+    def __init__(self, gold_model, gold_weights, dataset, num_per_class, log_on=False, device="cpu"):
         # Gold
         self.gold_model   = gold_model
         self.gold_weights = gold_weights
@@ -34,11 +34,13 @@ class ProgTrojResults:
             model          = self.gold_model,
             transformation = self.gold_weights.transforms(),
             categories     = self.gold_weights.meta["categories"],
-            log            = False
+            log            = False,
+            device         = device
         )
         self.DUT_Wrapper.log_on = False
 
         # testing
+        self.device = device
         self.dataset = dataset
         self.image_key = "image" if "image" in self.dataset[0] else "img"
         self.label_key = "fine_label" if "fine_label" in self.dataset[0] else "label"
@@ -88,9 +90,11 @@ class ProgTrojResults:
         results = [None] * total_tests
         total_top1 = 0
         total_top5 = 0
+
         for index in range(total_tests):
             test = self.tests[index]
-            final_logits = self.gold_model(test[0])
+            input_tensor = test[0].to(self.device)
+            final_logits = self.gold_model(input_tensor)
             probabilities = torch.nn.functional.softmax(final_logits, dim=-1)
 
             top1 = torch.topk(probabilities, 1, dim=-1)
@@ -449,6 +453,9 @@ HF_TOKEN = ""
 if __name__ == "__main__":
     login(token=HF_TOKEN)
 
+    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    torch.set_default_device(device)
+
     work_orders = [
         {"results" : None, "config":False, "benign":True, "trigger":"XOR", "payload":"OFFSET"}, # benign is no trig/payload
 
@@ -467,19 +474,19 @@ if __name__ == "__main__":
     ]
 
     # ===== IMAGE NET 1k =====
-    imagenet1k = load_dataset("ILSVRC/imagenet-1k", split="validation", streaming=False, token=HF_TOKEN)
+    #imagenet1k = load_dataset("ILSVRC/imagenet-1k", split="validation", streaming=False, token=HF_TOKEN)
 
-    resnet18_imagenet1k_weights = models.ResNet18_Weights.IMAGENET1K_V1
-    resnet18 = models.resnet18(weights=resnet18_imagenet1k_weights).eval()
+    #resnet18_imagenet1k_weights = models.ResNet18_Weights.IMAGENET1K_V1
+    #resnet18 = models.resnet18(weights=resnet18_imagenet1k_weights).eval()
 
-    resnet50_imagenet1k_weights = models.ResNet50_Weights.IMAGENET1K_V2
-    resnet50 = models.resnet50(weights=resnet50_imagenet1k_weights).eval()
+    #resnet50_imagenet1k_weights = models.ResNet50_Weights.IMAGENET1K_V2
+    #resnet50 = models.resnet50(weights=resnet50_imagenet1k_weights).eval()
 
-    mobilenet_v2_imagenet1k_weights = models.MobileNet_V2_Weights.IMAGENET1K_V2
-    mobilenet_v2 = models.mobilenet_v2(weights=mobilenet_v2_imagenet1k_weights).eval()
+    #mobilenet_v2_imagenet1k_weights = models.MobileNet_V2_Weights.IMAGENET1K_V2
+    #mobilenet_v2 = models.mobilenet_v2(weights=mobilenet_v2_imagenet1k_weights).eval()
 
-    vit_b_16_imagenet1k_weights = models.ViT_B_16_Weights.IMAGENET1K_V1
-    vit_b_16 = models.vit_b_16(weights=vit_b_16_imagenet1k_weights).eval()
+    #vit_b_16_imagenet1k_weights = models.ViT_B_16_Weights.IMAGENET1K_V1
+    #vit_b_16 = models.vit_b_16(weights=vit_b_16_imagenet1k_weights).eval()
 
     # ===== CIFAR 10 =====
     cifar10 = load_dataset("uoft-cs/cifar10", split="test", streaming=False)
@@ -513,58 +520,58 @@ if __name__ == "__main__":
     vit_b_16_cifar10_weights = CIFARWeights( vit_b_16_cifar10_transform, state_dict=vit_b_16_cifar10.state_dict(),)
 
     # ===== CIFAR 100 =====
-    cifar100 = load_dataset("uoft-cs/cifar100", split="test", streaming=False)
+    #cifar100 = load_dataset("uoft-cs/cifar100", split="test", streaming=False)
 
-    cifar100_cnn_transform = transforms.Compose([ transforms.ToTensor(), transforms.Normalize(mean=(0.5071, 0.4867, 0.4408), std=(0.2675, 0.2565, 0.2761)), ])
+    #cifar100_cnn_transform = transforms.Compose([ transforms.ToTensor(), transforms.Normalize(mean=(0.5071, 0.4867, 0.4408), std=(0.2675, 0.2565, 0.2761)), ])
 
-    resnet18_cifar100 = timm.create_model("resnet18", num_classes=100, pretrained=False)
-    resnet18_cifar100.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
-    resnet18_cifar100.maxpool = nn.Identity()
-    ckpt_path = hf_hub_download( repo_id="edadaltocg/resnet18_cifar100", filename="pytorch_model.bin", token=HF_TOKEN,)
-    resnet18_cifar100.load_state_dict(torch.load(ckpt_path, map_location="cpu", weights_only=True))
-    resnet18_cifar100.eval()
-    resnet18_cifar100_weights = CIFARWeights( cifar100_cnn_transform, state_dict=resnet18_cifar100.state_dict(), meta={"categories": cifar100.features["fine_label"].names},)
+    #resnet18_cifar100 = timm.create_model("resnet18", num_classes=100, pretrained=False)
+    #resnet18_cifar100.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+    #resnet18_cifar100.maxpool = nn.Identity()
+    #ckpt_path = hf_hub_download( repo_id="edadaltocg/resnet18_cifar100", filename="pytorch_model.bin", token=HF_TOKEN,)
+    #resnet18_cifar100.load_state_dict(torch.load(ckpt_path, map_location="cpu", weights_only=True))
+    #resnet18_cifar100.eval()
+    #resnet18_cifar100_weights = CIFARWeights( cifar100_cnn_transform, state_dict=resnet18_cifar100.state_dict(), meta={"categories": cifar100.features["fine_label"].names},)
 
-    resnet50_cifar100 = timm.create_model("resnet50", num_classes=100, pretrained=False)
-    resnet50_cifar100.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
-    resnet50_cifar100.maxpool = nn.Identity()
-    ckpt_path = hf_hub_download( repo_id="edadaltocg/resnet50_cifar100", filename="pytorch_model.bin", token=HF_TOKEN,)
-    resnet50_cifar100.load_state_dict(torch.load(ckpt_path, map_location="cpu", weights_only=True))
-    resnet50_cifar100.eval()
-    resnet50_cifar100_weights = CIFARWeights( cifar100_cnn_transform, state_dict=resnet50_cifar100.state_dict(), meta={"categories": cifar100.features["fine_label"].names},)
+    #resnet50_cifar100 = timm.create_model("resnet50", num_classes=100, pretrained=False)
+    #resnet50_cifar100.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+    #resnet50_cifar100.maxpool = nn.Identity()
+    #ckpt_path = hf_hub_download( repo_id="edadaltocg/resnet50_cifar100", filename="pytorch_model.bin", token=HF_TOKEN,)
+    #resnet50_cifar100.load_state_dict(torch.load(ckpt_path, map_location="cpu", weights_only=True))
+    #resnet50_cifar100.eval()
+    #resnet50_cifar100_weights = CIFARWeights( cifar100_cnn_transform, state_dict=resnet50_cifar100.state_dict(), meta={"categories": cifar100.features["fine_label"].names},)
 
-    mobilenet_v2_cifar100 = torch.hub.load( "chenyaofo/pytorch-cifar-models", "cifar100_mobilenetv2_x1_0", pretrained=True,).eval()
-    mobilenet_v2_cifar100_weights = CIFARWeights( cifar100_cnn_transform, state_dict=mobilenet_v2_cifar100.state_dict(), meta={"categories": cifar100.features["fine_label"].names},)
+    #mobilenet_v2_cifar100 = torch.hub.load( "chenyaofo/pytorch-cifar-models", "cifar100_mobilenetv2_x1_0", pretrained=True,).eval()
+    #mobilenet_v2_cifar100_weights = CIFARWeights( cifar100_cnn_transform, state_dict=mobilenet_v2_cifar100.state_dict(), meta={"categories": cifar100.features["fine_label"].names},)
 
-    vit_b_16_cifar100 = timm.create_model( "vit_base_patch16_224.orig_in21k_ft_in1k", num_classes=100, pretrained=False,)
-    ckpt_path = hf_hub_download( repo_id="edadaltocg/vit_base_patch16_224_in21k_ft_cifar100", filename="pytorch_model.bin", token=HF_TOKEN,)
-    vit_b_16_cifar100.load_state_dict(torch.load(ckpt_path, map_location="cpu", weights_only=True))
-    vit_b_16_cifar100.eval()
-    vit_b_16_cifar100_transform = timm.data.create_transform( **timm.data.resolve_model_data_config(vit_b_16_cifar100), is_training=False,)
-    vit_b_16_cifar100_weights = CIFARWeights( vit_b_16_cifar100_transform, state_dict=vit_b_16_cifar100.state_dict(), meta={"categories": cifar100.features["fine_label"].names},)
+    #vit_b_16_cifar100 = timm.create_model( "vit_base_patch16_224.orig_in21k_ft_in1k", num_classes=100, pretrained=False,)
+    #ckpt_path = hf_hub_download( repo_id="edadaltocg/vit_base_patch16_224_in21k_ft_cifar100", filename="pytorch_model.bin", token=HF_TOKEN,)
+    #vit_b_16_cifar100.load_state_dict(torch.load(ckpt_path, map_location="cpu", weights_only=True))
+    #vit_b_16_cifar100.eval()
+    #vit_b_16_cifar100_transform = timm.data.create_transform( **timm.data.resolve_model_data_config(vit_b_16_cifar100), is_training=False,)
+    #vit_b_16_cifar100_weights = CIFARWeights( vit_b_16_cifar100_transform, state_dict=vit_b_16_cifar100.state_dict(), meta={"categories": cifar100.features["fine_label"].names},)
 
     # All Tests:
     test_conditions = [
-        ("resnet18_imagenet1k", resnet18, resnet18_imagenet1k_weights, imagenet1k),
-        ("resnet50_imagenet1k", resnet50, resnet50_imagenet1k_weights, imagenet1k),
-        ("mobilenetv2_imagenet1k", mobilenet_v2, mobilenet_v2_imagenet1k_weights, imagenet1k),
-        ("vitb16_imagenet1k", vit_b_16, vit_b_16_imagenet1k_weights, imagenet1k),
+        #("resnet18_imagenet1k", resnet18, resnet18_imagenet1k_weights, imagenet1k),
+        #("resnet50_imagenet1k", resnet50, resnet50_imagenet1k_weights, imagenet1k),
+        #("mobilenetv2_imagenet1k", mobilenet_v2, mobilenet_v2_imagenet1k_weights, imagenet1k),
+        #("vitb16_imagenet1k", vit_b_16, vit_b_16_imagenet1k_weights, imagenet1k),
 
         ("resnet18_cifar10", resnet18_cifar10, resnet18_cifar10_weights, cifar10),
         ("resnet50_cifar10", resnet50_cifar10, resnet50_cifar10_weights, cifar10),
         ("mobilenetv2_cifar10", mobilenet_v2_cifar10, mobilenet_v2_cifar10_weights, cifar10),
         ("vitb16_cifar10", vit_b_16_cifar10, vit_b_16_cifar10_weights, cifar10),
 
-        ("resnet18_cifar100", resnet18_cifar100, resnet18_cifar100_weights, cifar100),
-        ("resnet50_cifar100", resnet50_cifar100, resnet50_cifar100_weights, cifar100),
-        ("mobilenetv2_cifar100", mobilenet_v2_cifar100, mobilenet_v2_cifar100_weights, cifar100),
-        ("vitb16_cifar100", vit_b_16_cifar100, vit_b_16_cifar100_weights, cifar100),
+        #("resnet18_cifar100", resnet18_cifar100, resnet18_cifar100_weights, cifar100),
+        #("resnet50_cifar100", resnet50_cifar100, resnet50_cifar100_weights, cifar100),
+        #("mobilenetv2_cifar100", mobilenet_v2_cifar100, mobilenet_v2_cifar100_weights, cifar100),
+        #("vitb16_cifar100", vit_b_16_cifar100, vit_b_16_cifar100_weights, cifar100),
     ]
 
     all_results = []
 
     # num per class : 5 for imagenet
-    num_per_class = 5
+    num_per_class = -1
 
     try:
         for test_name, gold_model, weights, dataset in test_conditions:
@@ -574,7 +581,8 @@ if __name__ == "__main__":
                     gold_model     = gold_model,
                     gold_weights   = weights,
                     dataset        = dataset,
-                    num_per_class  = num_per_class
+                    num_per_class  = num_per_class,
+                    device         = "mps"
                 )
 
                 output = []
@@ -583,6 +591,7 @@ if __name__ == "__main__":
                     res = results_abstraction(**order)
                     all_results.append((test_name, *res))
                     output.append(res)
+                    print(res)
 
                 with open(f"results/{test_name}.csv", "w", newline="", encoding="utf-8") as file:
                     writer = csv.writer(file)
@@ -596,7 +605,7 @@ if __name__ == "__main__":
         print(f"\nStopped due to: {type(e).__name__}: {e}")
         print("All results collected so far:")
         print(all_results)
-        exit(1)
+        raise
 
     print(all_results)
 
